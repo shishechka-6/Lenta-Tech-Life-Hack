@@ -1,0 +1,6 @@
+path: /Users/alex/ML Projects/Lenta Tech Life Hack/data/yolo
+train: images/train
+val: images/val
+
+nc: 1
+names: ['price_tag']

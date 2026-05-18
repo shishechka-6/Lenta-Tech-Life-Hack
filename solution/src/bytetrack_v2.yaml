@@ -1,0 +1,10 @@
+# ByteTrack config — Tier 3b: ПОЧТИ default + только track_buffer для occlusion
+# Tier 3a (aggressive tuning) сделал capture хуже на 8 ценников — откат.
+
+tracker_type: bytetrack
+track_high_thresh: 0.25
+track_low_thresh: 0.1
+new_track_thresh: 0.25
+track_buffer: 60            # ONLY change — longer occlusion memory
+match_thresh: 0.8
+fuse_score: True

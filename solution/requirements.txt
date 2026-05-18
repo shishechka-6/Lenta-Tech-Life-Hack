@@ -1,0 +1,19 @@
+# Core
+numpy>=1.26,<2.2
+pandas>=2.2
+matplotlib>=3.9
+tqdm>=4.66
+
+# Computer Vision
+opencv-contrib-python>=4.10   # contrib даёт wechat_qrcode + xfeatures2d
+ultralytics>=8.4              # YOLO11n + ByteTrack
+
+# OCR & barcode
+paddleocr>=3.0                # PP-OCRv5 (ru)
+paddlepaddle>=3.0             # backend для PaddleOCR (arm64 macOS / Linux CPU)
+zxing-cpp>=2.2                # 1D штрихкоды (EAN-13/Code128)
+
+# Notebooks
+jupyter>=1.1
+nbformat>=5.10
+ipykernel>=6.29
