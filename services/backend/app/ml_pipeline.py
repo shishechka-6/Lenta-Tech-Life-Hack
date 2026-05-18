@@ -687,22 +687,51 @@ class FieldExtractor:
     """
 
     def __init__(self) -> None:
+        self.stats: Counter = Counter()
+        self._ocr_error_logged = False
         self._ocr = self._load_ocr()
         self._zxing = self._load_zxing()
         self._wechat_qr = self._load_wechat_qr()
         self._cv_qr = None  # инициализируется лениво при первом вызове
+        logger.info(
+            "field_extractor_ready ocr=%s zxing=%s wechat_qr=%s",
+            self._ocr is not None,
+            self._zxing is not None,
+            self._wechat_qr is not None,
+        )
+
+    @property
+    def ocr_available(self) -> bool:
+        return self._ocr is not None
 
     @staticmethod
     def _load_ocr():
         try:
             from paddleocr import PaddleOCR
-        except Exception:
+        except Exception as exc:
+            logger.exception("paddleocr_import_failed error=%s", exc)
             return None
         try:
-            return PaddleOCR(lang="ru", use_textline_orientation=True)
+            logger.info("paddleocr_init_start")
+            ocr = PaddleOCR(
+                lang="ru",
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
+            )
+            logger.info("paddleocr_init_done")
+            return ocr
         except TypeError:
-            return PaddleOCR(lang="ru", use_angle_cls=True)
-        except Exception:
+            try:
+                logger.info("paddleocr_init_start legacy_args=true")
+                ocr = PaddleOCR(lang="ru", use_angle_cls=False)
+                logger.info("paddleocr_init_done legacy_args=true")
+                return ocr
+            except Exception as exc:
+                logger.exception("paddleocr_init_failed legacy_args=true error=%s", exc)
+                return None
+        except Exception as exc:
+            logger.exception("paddleocr_init_failed error=%s", exc)
             return None
 
     @staticmethod
@@ -724,12 +753,21 @@ class FieldExtractor:
 
     def extract(self, crop) -> dict[str, Any]:
         """Запускает OCR/zxing/QR на одном кропе и парсит поля."""
+        self.stats["crops_seen"] += 1
         if crop is None or crop.size == 0:
+            self.stats["empty_crops"] += 1
             return {}
 
         lines = self._ocr_lines(crop)
         zxing_bc = self._decode_barcode_1d(crop)
         qr = self._decode_qr(crop)
+        if lines:
+            self.stats["ocr_crops_with_text"] += 1
+            self.stats["ocr_lines"] += len(lines)
+        if zxing_bc:
+            self.stats["barcode_crops"] += 1
+        if qr:
+            self.stats["qr_crops"] += 1
 
         if not lines and not zxing_bc and not qr:
             return {}
@@ -752,7 +790,10 @@ class FieldExtractor:
             if v not in (None, ""):
                 parsed[k] = v
 
-        return {k: v for k, v in parsed.items() if v not in (None, "")}
+        result = {k: v for k, v in parsed.items() if v not in (None, "")}
+        if result:
+            self.stats["parsed_crops"] += 1
+        return result
 
     def _ocr_lines(self, crop) -> list[OcrLine]:
         if self._ocr is None:
@@ -762,7 +803,11 @@ class FieldExtractor:
                 result = self._ocr.predict(crop)
             else:
                 result = self._ocr.ocr(crop)
-        except Exception:
+        except Exception as exc:
+            self.stats["ocr_errors"] += 1
+            if not self._ocr_error_logged:
+                logger.exception("paddleocr_predict_failed_once error=%s", exc)
+                self._ocr_error_logged = True
             return []
         return self._normalize_ocr_result(result)
 
@@ -774,21 +819,56 @@ class FieldExtractor:
         if first is None:
             return []
         lines: list[OcrLine] = []
+        for paddle_dict in FieldExtractor._paddle_result_dicts(first):
+            lines.extend(FieldExtractor._lines_from_paddle_dict(paddle_dict))
+            if lines:
+                return lines
         if isinstance(first, dict):
-            texts = first.get("rec_texts", [])
-            scores = first.get("rec_scores", [])
-            boxes = first.get("rec_boxes", first.get("rec_polys", []))
-            for text, score, box in zip(texts, scores, boxes):
+            return lines
+        try:
+            legacy_items = first or []
+            for item in legacy_items:
+                try:
+                    box, text_score = item[0], item[1]
+                    text, score = text_score[0], text_score[1]
+                except Exception:
+                    continue
                 normalized = FieldExtractor._line_from_box(text, score, box)
                 if normalized:
                     lines.append(normalized)
+        except TypeError:
             return lines
-        for item in first or []:
+        return lines
+
+    @staticmethod
+    def _paddle_result_dicts(result_item) -> list[dict[str, Any]]:
+        candidates: list[dict[str, Any]] = []
+        if isinstance(result_item, dict):
+            candidates.append(result_item)
+        json_payload = getattr(result_item, "json", None)
+        if json_payload is not None:
             try:
-                box, text_score = item[0], item[1]
-                text, score = text_score[0], text_score[1]
+                if callable(json_payload):
+                    json_payload = json_payload()
+                if isinstance(json_payload, dict):
+                    candidates.append(json_payload)
             except Exception:
-                continue
+                pass
+        expanded: list[dict[str, Any]] = []
+        for candidate in candidates:
+            nested = candidate.get("res")
+            if isinstance(nested, dict):
+                expanded.append(nested)
+            expanded.append(candidate)
+        return expanded
+
+    @staticmethod
+    def _lines_from_paddle_dict(result_item: dict[str, Any]) -> list[OcrLine]:
+        texts = result_item.get("rec_texts", [])
+        scores = result_item.get("rec_scores", [])
+        boxes = result_item.get("rec_boxes", result_item.get("rec_polys", []))
+        lines: list[OcrLine] = []
+        for text, score, box in zip(texts, scores, boxes):
             normalized = FieldExtractor._line_from_box(text, score, box)
             if normalized:
                 lines.append(normalized)
@@ -918,17 +998,42 @@ class PriceTagProcessor:
 
         report("ocr", "Загрузка OCR и декодеров", 60)
         field_extractor = self._get_field_extractor()
+        if not field_extractor.ocr_available:
+            raise PipelineError("PaddleOCR is not available; check backend logs for paddleocr_import/init_failed")
+        field_extractor.stats.clear()
         report("ocr", f"OCR по трекам: {len(tracks)}", 65)
 
         rows: list[dict[str, str]] = []
         records: list[dict[str, Any]] = []
+        parsed_tracks = 0
+        field_counts: Counter = Counter()
 
         for track_id in sorted(tracks, key=_track_sort_key):
             crops = tracks[track_id]["crops"]
             per_crop_fields = [field_extractor.extract(crop) for crop in crops]
             aggregated = self._aggregate_fields(per_crop_fields)
+            meaningful_fields = {k: v for k, v in aggregated.items() if k != "color"}
+            if meaningful_fields:
+                parsed_tracks += 1
+                field_counts.update(meaningful_fields.keys())
             records.append({"_track_id": track_id, **aggregated})
-        report("ocr", f"OCR завершен: {len(records)} треков", 85)
+        stats = dict(field_extractor.stats)
+        logger.info(
+            "ocr_summary tracks=%s parsed_tracks=%s stats=%s fields=%s",
+            len(records),
+            parsed_tracks,
+            stats,
+            dict(field_counts),
+        )
+        report(
+            "ocr",
+            (
+                f"OCR завершен: треков {len(records)}, "
+                f"с текстом {stats.get('ocr_crops_with_text', 0)} кропов, "
+                f"распарсилось {parsed_tracks}"
+            ),
+            85,
+        )
 
         # Post-processing над всеми треками сразу (нужно для per-video code dedup)
         report("postprocess", "Постобработка результата", 92)
