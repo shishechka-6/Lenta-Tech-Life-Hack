@@ -1,0 +1,60 @@
+name: lenta-tech
+
+services:
+  backend:
+    image: ${BACKEND_IMAGE:?set BACKEND_IMAGE in .env.prod}
+    pull_policy: always
+    environment:
+      LENTA_MODEL_PATH: /models/best.pt
+      LENTA_DEVICE: ${LENTA_DEVICE:-cpu}
+      LENTA_CONF: ${LENTA_CONF:-0.25}
+      LENTA_IOU: ${LENTA_IOU:-0.5}
+      LENTA_IMGSZ: ${LENTA_IMGSZ:-1280}
+      LENTA_STORAGE_DIR: /tmp/lenta-tech-backend
+      LENTA_MAX_UPLOAD_MB: ${LENTA_MAX_UPLOAD_MB:-2048}
+      YOLO_CONFIG_DIR: /cache/ultralytics
+      PADDLE_PDX_CACHE_HOME: /cache/paddlex
+      PADDLEOCR_HOME: /cache/paddleocr
+      PADDLE_HOME: /cache/paddle
+    ports:
+      - "${BACKEND_BIND:-127.0.0.1}:${BACKEND_PORT:-8000}:8000"
+    volumes:
+      - ${MODEL_PATH:?set MODEL_PATH in .env.prod}:/models/best.pt:ro
+      - backend-ultralytics-cache:/cache/ultralytics
+      - backend-paddlex-cache:/cache/paddlex
+      - backend-paddleocr-cache:/cache/paddleocr
+      - backend-paddle-cache:/cache/paddle
+    tmpfs:
+      - /tmp/lenta-tech-backend:size=${BACKEND_TMPFS_SIZE:-4g}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+
+  frontend:
+    image: ${FRONTEND_IMAGE:?set FRONTEND_IMAGE in .env.prod}
+    pull_policy: always
+    environment:
+      BACKEND_URL: http://backend:8000
+      REQUEST_TIMEOUT_SECONDS: ${REQUEST_TIMEOUT_SECONDS:-3600}
+    ports:
+      - "${FRONTEND_BIND:-0.0.0.0}:${FRONTEND_PORT:-8501}:8501"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health', timeout=2).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  backend-ultralytics-cache:
+  backend-paddlex-cache:
+  backend-paddleocr-cache:
+  backend-paddle-cache:

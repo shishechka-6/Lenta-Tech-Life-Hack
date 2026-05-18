@@ -9,6 +9,8 @@ __pycache__/
 .vscode/
 .DS_Store
 Thumbs.db
+.env.prod
+deploy/.env.prod
 
 Данные/
 Khasan_Dataset/
