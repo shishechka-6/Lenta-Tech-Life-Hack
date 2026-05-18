@@ -12,6 +12,7 @@ services:
       LENTA_IMGSZ: ${LENTA_IMGSZ:-1280}
       LENTA_STORAGE_DIR: /tmp/lenta-tech-backend
       LENTA_MAX_UPLOAD_MB: ${LENTA_MAX_UPLOAD_MB:-2048}
+      LENTA_JOB_WORKERS: ${LENTA_JOB_WORKERS:-1}
       YOLO_CONFIG_DIR: /cache/ultralytics
       PADDLE_PDX_CACHE_HOME: /cache/paddlex
       PADDLEOCR_HOME: /cache/paddleocr
@@ -40,6 +41,7 @@ services:
     environment:
       BACKEND_URL: http://backend:8000
       REQUEST_TIMEOUT_SECONDS: ${REQUEST_TIMEOUT_SECONDS:-3600}
+      POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-2}
     ports:
       - "${FRONTEND_BIND:-0.0.0.0}:${FRONTEND_PORT:-8501}:8501"
     depends_on:

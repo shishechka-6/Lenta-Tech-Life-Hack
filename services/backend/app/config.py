@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     imgsz: int = 1280
     max_frames: int | None = None
     max_upload_mb: int = 2048
+    job_workers: int = 1
 
 
 settings = Settings()

@@ -53,6 +53,12 @@ docker compose --env-file deploy/.env.prod -f deploy/docker-compose.prod.yml ps
 docker compose --env-file deploy/.env.prod -f deploy/docker-compose.prod.yml logs -f --tail=100
 ```
 
+Backend пишет стадии обработки в stdout. Для живой диагностики удобно смотреть только backend:
+
+```bash
+docker compose --env-file deploy/.env.prod -f deploy/docker-compose.prod.yml logs -f backend
+```
+
 ## GitHub Actions
 
 Workflow `.github/workflows/deploy.yml` запускается на каждый push в ветку `deploy`:

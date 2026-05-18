@@ -27,13 +27,18 @@ import csv
 import difflib
 import io
 import json
+import logging
 import math
 import re
 import time
 from collections import Counter, defaultdict, namedtuple
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+
+logger = logging.getLogger("uvicorn.error")
+ProgressCallback = Callable[[str, str, int], None]
 
 
 # ─── Submission schema (sans bbox/timestamp — backend produces simplified format)
@@ -889,12 +894,32 @@ class PriceTagProcessor:
         self._field_extractor: FieldExtractor | None = None
         self._db_codes: set[str] | None = None
 
-    def process(self, video_path: Path, original_filename: str | None = None) -> ProcessingResult:
+    def process(
+        self,
+        video_path: Path,
+        original_filename: str | None = None,
+        progress_callback: ProgressCallback | None = None,
+    ) -> ProcessingResult:
+        def report(stage: str, message: str, progress: int) -> None:
+            if progress_callback is None:
+                return
+            try:
+                progress_callback(stage, message, progress)
+            except Exception:
+                logger.exception("progress callback failed")
+
         start = time.perf_counter()
         video_id = Path(original_filename or video_path.name).stem
-        tracks, frames_seen = self._track_price_tags(video_path)
+        report("preprocess", "Подготовка видео", 10)
 
+        report("yolo", "YOLO трекинг ценников", 25)
+        tracks, frames_seen = self._track_price_tags(video_path)
+        report("yolo", f"YOLO завершен: {len(tracks)} треков, {frames_seen} кадров", 55)
+
+        report("ocr", "Загрузка OCR и декодеров", 60)
         field_extractor = self._get_field_extractor()
+        report("ocr", f"OCR по трекам: {len(tracks)}", 65)
+
         rows: list[dict[str, str]] = []
         records: list[dict[str, Any]] = []
 
@@ -903,8 +928,10 @@ class PriceTagProcessor:
             per_crop_fields = [field_extractor.extract(crop) for crop in crops]
             aggregated = self._aggregate_fields(per_crop_fields)
             records.append({"_track_id": track_id, **aggregated})
+        report("ocr", f"OCR завершен: {len(records)} треков", 85)
 
         # Post-processing над всеми треками сразу (нужно для per-video code dedup)
+        report("postprocess", "Постобработка результата", 92)
         self._post_process(records)
 
         for r in records:
@@ -918,6 +945,7 @@ class PriceTagProcessor:
             rows.append(row)
 
         elapsed = time.perf_counter() - start
+        report("postprocess", "Формирование CSV", 97)
         return ProcessingResult(
             columns=SUBMISSION_COLUMNS,
             rows=rows,
