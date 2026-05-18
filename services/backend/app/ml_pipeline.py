@@ -1,14 +1,42 @@
+"""Production pipeline for price-tag recognition from 4K supermarket video.
+
+Self-contained: no imports from ``solution/``. All parser logic is inlined so
+the file can be deployed as part of the backend package without bundling the
+research notebooks.
+
+Public API matches the FastAPI consumer:
+
+    from .ml_pipeline import PipelineError, PriceTagProcessor
+
+Pipeline stages:
+
+    1. YOLO11n + ByteTrack — detect & track price tags across frames.
+    2. Top-K sharpest keyframes per track (Laplacian variance × √area).
+    3. Per-crop FieldExtractor — PaddleOCR + zxing-cpp + QR decoders + parsers.
+    4. Multi-frame consensus — Counter.most_common per field.
+    5. Post-processing — DB sanity filter, QR mirror, validators, canonicalisation.
+
+The pipeline intentionally drops the VLM second-pass (Qwen2.5-VL on Kaggle
+T4×2 takes ~5h); for an interactive backend this is not viable. Quality on
+``code/id_sku/print_datetime/barcode`` is therefore lower than the offline
+notebook pipeline (3/157 = 1.9% strict), but the architecture is the same.
+"""
 from __future__ import annotations
 
 import csv
+import difflib
 import io
+import json
 import math
 import re
 import time
+from collections import Counter, defaultdict, namedtuple
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+
+# ─── Submission schema (sans bbox/timestamp — backend produces simplified format)
 
 SUBMISSION_COLUMNS = [
     "video",
@@ -37,6 +65,17 @@ SUBMISSION_COLUMNS = [
     "action_price_qr",
     "action_code_qr",
 ]
+
+QR_FIELDS = (
+    "qr_code_barcode",
+    "price1_qr", "price2_qr", "price3_qr", "price4_qr",
+    "wholesale_level_1_count", "wholesale_level_1_price",
+    "wholesale_level_2_count", "wholesale_level_2_price",
+    "action_price_qr", "action_code_qr",
+)
+
+
+# ─── Exceptions and DTOs
 
 
 class PipelineError(RuntimeError):
@@ -85,7 +124,6 @@ def _track_sort_key(track_id: Any) -> tuple[int, Any]:
 def _select_device(requested_device: str) -> str:
     if requested_device and requested_device != "auto":
         return requested_device
-
     try:
         import torch
 
@@ -95,16 +133,735 @@ def _select_device(requested_device: str) -> str:
             return "mps"
     except Exception:
         pass
-
     return "cpu"
 
 
-class PriceTagProcessor:
-    """Thin service wrapper around the current detection stage.
+# ─── Shared OCR primitives ────────────────────────────────────────────────────
 
-    The notebook pipeline already contains OCR and field parsers, but it is not yet
-    packaged as importable production code. This class gives the backend a stable
-    service contract today: one uploaded video in, submission-shaped rows out.
+OcrLine = namedtuple("OcrLine", ["text", "x", "y", "w", "h", "conf"])
+
+
+def cx(line: OcrLine) -> float:
+    return line.x + line.w / 2
+
+
+def cy(line: OcrLine) -> float:
+    return line.y + line.h / 2
+
+
+SUPER_TRANS = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹", "0123456789")
+
+DIGIT_FIX = str.maketrans({
+    "З": "3", "з": "3",
+    "O": "0", "o": "0", "О": "0", "о": "0",
+    "I": "1", "l": "1", "i": "1",
+    "B": "8", "В": "8",
+    "S": "5", "Ѕ": "5",
+})
+
+LATIN_TO_CYR_NORM = str.maketrans({
+    "A": "А", "B": "В", "C": "С", "E": "Е", "H": "Н", "K": "К", "M": "М",
+    "O": "О", "P": "Р", "T": "Т", "X": "Х", "Y": "У",
+    "a": "а", "c": "с", "e": "е", "o": "о", "p": "р", "x": "х", "y": "у",
+})
+
+LATIN_TO_CYR_HINTS = str.maketrans({
+    "a": "а", "A": "а", "c": "с", "C": "с", "e": "е", "E": "е",
+    "o": "о", "O": "о", "p": "р", "P": "р", "x": "х", "X": "х",
+    "y": "у", "Y": "у", "b": "ь", "B": "в", "h": "н", "H": "н",
+    "k": "к", "K": "к", "m": "м", "M": "м", "t": "т", "T": "т",
+    "r": "г", "n": "п",
+})
+
+
+def ean13_checksum_ok(value: str) -> bool:
+    digits = re.sub(r"\D", "", value)
+    if len(digits) != 13:
+        return False
+    parsed = [int(c) for c in digits]
+    parity = sum(v * (3 if i % 2 else 1) for i, v in enumerate(parsed[:-1]))
+    return (10 - parity % 10) % 10 == parsed[-1]
+
+
+# ─── Parsers ──────────────────────────────────────────────────────────────────
+
+
+def parse_barcode(lines: list[OcrLine]) -> str | None:
+    if not lines:
+        return None
+    height = max(L.y + L.h for L in lines)
+    candidates: list[tuple[str, float]] = []
+    for L in lines:
+        for digits in re.findall(r"\d{10,14}", re.sub(r"\D", "", L.text)):
+            if len(digits) > 14:
+                continue
+            bottom_bonus = (cy(L) / max(height, 1)) ** 2
+            valid_bonus = 2.0 if (len(digits) == 13 and ean13_checksum_ok(digits)) else 0.0
+            score = len(digits) * 0.5 + bottom_bonus + L.conf + valid_bonus
+            candidates.append((digits, score))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: -x[1])
+    return candidates[0][0]
+
+
+def parse_id_sku(lines: list[OcrLine], barcode_value: str | None = None) -> str | None:
+    if not lines:
+        return None
+    height = max(L.y + L.h for L in lines)
+    bc = barcode_value or ""
+    candidates: list[tuple[str, float]] = []
+    for L in lines:
+        for digits in re.findall(r"\d{8,12}", re.sub(r"\D", "", L.text)):
+            if not (8 <= len(digits) <= 12):
+                continue
+            if bc and (digits == bc or digits in bc or bc in digits):
+                continue
+            rel_y = cy(L) / max(height, 1)
+            if rel_y < 0.3:
+                continue
+            score = L.conf + (1.0 - abs(rel_y - 0.7)) + (0.3 if 9 <= len(digits) <= 12 else 0)
+            candidates.append((digits, score))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: -x[1])
+    return candidates[0][0]
+
+
+_DATETIME_RE_FULL = re.compile(r"(\d{2})[.\-/](\d{2})[.\-/](\d{4})[\D]+(\d{1,2})[:.]\s*(\d{2})")
+_DATETIME_RE_DATE = re.compile(r"(\d{2})[.\-/](\d{2})[.\-/](\d{4})")
+_TIME_RE = re.compile(r"^(\d{1,2})[:.](\d{2})$")
+
+
+def parse_print_datetime(lines: list[OcrLine]) -> str | None:
+    for L in lines:
+        s = L.text.translate(DIGIT_FIX)
+        m = _DATETIME_RE_FULL.search(s)
+        if m:
+            dd, mm, yyyy, hh, mi = m.groups()
+            return f"{dd}.{mm}.{yyyy} {int(hh)}:{mi}"
+    for L in lines:
+        s = L.text.translate(DIGIT_FIX)
+        m = _DATETIME_RE_DATE.search(s)
+        if m:
+            dd, mm, yyyy = m.groups()
+            for L2 in lines:
+                if L2 is L:
+                    continue
+                m2 = _TIME_RE.match(L2.text.translate(DIGIT_FIX).strip())
+                if m2:
+                    return f"{dd}.{mm}.{yyyy} {int(m2.group(1))}:{m2.group(2)}"
+            return f"{dd}.{mm}.{yyyy}"
+    return None
+
+
+_DISCOUNT_RE_V2 = re.compile(r"[-−–—]?\s*([0-9OoIlbBg]{1,3})\s*%")
+_DISCOUNT_DIGIT_FIX = str.maketrans({"O": "0", "o": "0", "I": "1", "l": "1", "b": "6", "g": "9", "B": "8"})
+
+
+def parse_discount_amount_v2(lines: list[OcrLine]) -> str | None:
+    """v1 + tolerance к OCR-путаницам O→0, l→1 в цифрах скидки."""
+    best: tuple[int, float] | None = None
+    for L in lines:
+        m = _DISCOUNT_RE_V2.search(L.text)
+        if not m:
+            continue
+        raw = m.group(1).translate(_DISCOUNT_DIGIT_FIX)
+        if not raw.isdigit():
+            continue
+        n = int(raw)
+        if 1 <= n <= 99 and (best is None or L.h > best[1]):
+            best = (n, L.h)
+    return f"-{best[0]}%" if best else None
+
+
+_K_TOKENS = {"К", "к", "K", "k"}
+_SH_TOKENS = {"Ш", "ш"}
+
+
+def parse_special_symbols_v2(lines: list[OcrLine]) -> str | None:
+    """Маленький изолированный токен К или Ш."""
+    if not lines:
+        return None
+    for L in lines:
+        s = L.text.strip()
+        if s in _K_TOKENS:
+            return "К"
+        if s in _SH_TOKENS:
+            return "Ш"
+    candidates: list[tuple[str, OcrLine]] = []
+    for L in lines:
+        s = L.text.strip()
+        if not s or len(s) > 3:
+            continue
+        clean = re.sub(r"[^КкKkШш]", "", s)
+        if clean in _K_TOKENS:
+            candidates.append(("К", L))
+        elif clean in _SH_TOKENS:
+            candidates.append(("Ш", L))
+    if candidates:
+        sym, _L = min(candidates, key=lambda c: c[1].h)
+        return sym
+    return None
+
+
+ADDITIONAL_HINTS = (
+    "Полусладкое", "Полусухое", "Сладкое", "Сухое",
+    "Игристое", "Шипучее", "Десертное",
+    "по цене", "Удачная упаковка",
+)
+
+
+def _fuzzy_find_hint(text_lower: str, hint: str) -> bool:
+    h = hint.lower()
+    if h in text_lower:
+        return True
+    L = len(h)
+    if L < 4:
+        return False
+    threshold = 0.75 if L >= 8 else 0.78
+    for i in range(len(text_lower) - L + 1):
+        window = text_lower[i:i + L + 1]
+        ratio = difflib.SequenceMatcher(None, h, window).ratio()
+        if ratio >= threshold:
+            return True
+    return False
+
+
+def parse_additional_info(lines: list[OcrLine]) -> str | None:
+    raw = " ".join(L.text for L in lines).lower()
+    normalized = raw.translate(LATIN_TO_CYR_HINTS)
+    for hint in ADDITIONAL_HINTS:
+        if _fuzzy_find_hint(normalized, hint):
+            return hint
+    return None
+
+
+# Price parsing (v2)
+
+_PRICE_INLINE_RE = re.compile(r"(\d{1,5})[,.\s]+(\d{2})\b")
+_SOURCE_PRIORITY = {"inline": 0, "pair": 1, "int-only": 2}
+_MIN_DX_PX = 80
+_MIN_DY_PX = 35
+
+
+def _extract_integer(text: str) -> int | None:
+    s = text.translate(SUPER_TRANS).strip()
+    if re.fullmatch(r"[-−–—]?\s*\d{1,2}\s*%?", s):
+        if "%" in s or re.fullmatch(r"[-−–—]\s*\d{1,2}", s):
+            return None
+    runs = re.findall(r"\d+", s)
+    if not runs:
+        return None
+    longest = max(runs, key=len)
+    idx = s.find(longest)
+    if s[idx + len(longest): idx + len(longest) + 1] == "%":
+        return None
+    v = int(longest)
+    return v if 10 <= v <= 99999 else None
+
+
+def _try_inline_price(text: str) -> float | None:
+    m = _PRICE_INLINE_RE.search(text.translate(SUPER_TRANS))
+    if not m:
+        return None
+    v = int(m.group(1)) + int(m.group(2)) / 100.0
+    return v if v >= 10 else None
+
+
+def _fmt_price_ru(v: float) -> str:
+    return f"{v:.2f}".replace(".", ",")
+
+
+def _candidate_prices_v2(lines: list[OcrLine]) -> list[tuple[float, OcrLine, str]]:
+    cands: list[tuple[float, OcrLine, str]] = []
+    for L in lines:
+        v = _try_inline_price(L.text)
+        if v is not None:
+            cands.append((v, L, "inline"))
+    integers = [(v, L) for L in lines if (v := _extract_integer(L.text)) is not None]
+    decimals: list[tuple[int, OcrLine]] = []
+    for L in lines:
+        s = L.text.translate(SUPER_TRANS).strip()
+        m = re.fullmatch(r"[^\d]*(\d{2})[^\d]*", s)
+        if m:
+            decimals.append((int(m.group(1)), L))
+    for v_int, I in integers:
+        best, best_d = None, float("inf")
+        dx_thresh = max(2.5 * I.w, _MIN_DX_PX)
+        dy_thresh = max(1.5 * I.h, _MIN_DY_PX)
+        for d_val, D in decimals:
+            if D is I:
+                continue
+            dx = cx(D) - cx(I)
+            dy = cy(D) - cy(I)
+            if abs(dx) > dx_thresh or abs(dy) > dy_thresh:
+                continue
+            if dx < -0.3 * I.w:
+                continue
+            d = abs(dx) + 2.0 * abs(dy)
+            if d < best_d:
+                best, best_d = d_val, d
+        if best is not None:
+            cands.append((v_int + best / 100.0, I, "pair"))
+    for v_int, I in integers:
+        if v_int >= 100:
+            cands.append((float(v_int), I, "int-only"))
+    return cands
+
+
+def parse_prices_v2(lines: list[OcrLine]) -> dict[str, str | None]:
+    """price_card (всегда ,99) + price_default (force ,99 для int-only)."""
+    out: dict[str, str | None] = {"price_default": None, "price_card": None}
+    cands = _candidate_prices_v2(lines)
+    if not cands:
+        return out
+    best_by_line: dict[int, tuple[float, OcrLine, str]] = {}
+    for v, L, src in cands:
+        key = id(L)
+        if key not in best_by_line or _SOURCE_PRIORITY[src] < _SOURCE_PRIORITY[best_by_line[key][2]]:
+            best_by_line[key] = (v, L, src)
+    ordered = sorted(best_by_line.values(), key=lambda c: -c[1].h)
+    if ordered:
+        out["price_card"] = _fmt_price_ru(int(ordered[0][0]) + 0.99)
+    if len(ordered) > 1:
+        card_int = int(ordered[0][0])
+        for v, L, src in ordered[1:]:
+            v_int = int(v)
+            if v_int == card_int:
+                continue
+            if abs(v_int - card_int) / max(card_int, 1) <= 0.03:
+                continue
+            if src == "int-only":
+                out["price_default"] = _fmt_price_ru(v_int + 0.99)
+            else:
+                out["price_default"] = _fmt_price_ru(v)
+            break
+    return out
+
+
+def build_product_name(lines: list[OcrLine]) -> str | None:
+    if not lines:
+        return None
+    height = max(L.y + L.h for L in lines)
+    top = [
+        L for L in lines
+        if cy(L) < height * 0.55
+        and any(c.isalpha() for c in L.text)
+        and len(L.text.strip()) >= 2
+    ]
+    if not top:
+        return None
+    top.sort(key=lambda L: (L.y, L.x))
+    name = " ".join(L.text.strip() for L in top)
+    return name if len(name) >= 5 else None
+
+
+def normalize_product_name(s: str | None) -> str:
+    """Latin→Cyrillic homoglyph fold + lowercase + punct strip + collapse spaces."""
+    if not s or str(s).strip().lower() in ("", "нет", "none"):
+        return ""
+    s = str(s).translate(LATIN_TO_CYR_NORM).lower()
+    s = re.sub(r"[^a-zа-я0-9 ]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+# QR
+
+QR_KEY_MAP = {
+    "b": "qr_code_barcode", "barcode": "qr_code_barcode",
+    "p1": "price1_qr", "price1": "price1_qr",
+    "p2": "price2_qr", "price2": "price2_qr",
+    "p3": "price3_qr", "price3": "price3_qr",
+    "p4": "price4_qr", "price4": "price4_qr",
+    "wL1C": "wholesale_level_1_count", "wholesaleLevel1Count": "wholesale_level_1_count",
+    "wL1P": "wholesale_level_1_price", "wholesaleLevel1Price": "wholesale_level_1_price",
+    "wL2C": "wholesale_level_2_count", "wholesaleLevel2Count": "wholesale_level_2_count",
+    "wL2P": "wholesale_level_2_price", "wholesaleLevel2Price": "wholesale_level_2_price",
+    "aP": "action_price_qr", "actionPrice": "action_price_qr",
+    "aC": "action_code_qr", "actionCode": "action_code_qr",
+}
+
+
+def parse_qr_payload(text: str) -> dict[str, Any]:
+    if not text:
+        return {}
+    out: dict[str, Any] = {}
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if k in QR_KEY_MAP:
+                    out[QR_KEY_MAP[k]] = None if v == "" else v
+            return out
+    except Exception:
+        pass
+    for part in re.split(r"[&;,\n]", text):
+        m = re.match(r"\s*([A-Za-z0-9_]+)\s*[=:]\s*(.*?)\s*$", part)
+        if m and m.group(1) in QR_KEY_MAP:
+            out[QR_KEY_MAP[m.group(1)]] = None if m.group(2) == "" else m.group(2)
+    return out
+
+
+# ─── Validators ───────────────────────────────────────────────────────────────
+
+
+def valid_barcode(s: str | None) -> bool:
+    if not s:
+        return False
+    d = "".join(c for c in str(s) if c.isdigit())
+    if len(d) == 13:
+        return ean13_checksum_ok(d)
+    return len(d) in (8, 12)
+
+
+def valid_id_sku(s: str | None) -> bool:
+    if not s:
+        return False
+    d = "".join(c for c in str(s) if c.isdigit())
+    return 9 <= len(d) <= 12
+
+
+def valid_price(s: str | None) -> bool:
+    if not s:
+        return False
+    try:
+        f = float(str(s).replace(",", "."))
+        return 10.0 <= f <= 99999.0
+    except Exception:
+        return False
+
+
+def valid_datetime(s: str | None) -> bool:
+    if not s:
+        return False
+    return bool(re.fullmatch(r"\d{2}\.\d{2}\.\d{4}( \d{1,2}:\d{2})?", str(s)))
+
+
+def valid_discount(s: str | None) -> bool:
+    if not s:
+        return False
+    m = re.fullmatch(r"-\d{1,2}%", str(s))
+    if not m:
+        return False
+    return 1 <= int(str(s)[1:-1]) <= 99
+
+
+def valid_special_sym(s: str | None) -> bool:
+    return s in ("К", "Ш")
+
+
+def valid_code(s: str | None) -> bool:
+    """GT-форматы: '025017 - 026015', '01_025019', '21_ЦПУ', '024 017_1_6_2'."""
+    if not s:
+        return False
+    s = str(s).strip()
+    patterns = [
+        r"\d{4,7}\s*-\s*\d{4,7}",
+        r"\d{2}_\d{4,7}(\s*-\s*\d{4,7})?",
+        r"\d{2}_[А-ЯA-Z]{2,5}",
+        r"\d+ \d+(_\d+)+",
+    ]
+    return any(re.fullmatch(p, s) for p in patterns)
+
+
+VALIDATORS = {
+    "barcode": valid_barcode,
+    "id_sku": valid_id_sku,
+    "price_default": valid_price,
+    "price_card": valid_price,
+    "print_datetime": valid_datetime,
+    "discount_amount": valid_discount,
+    "special_symbols": valid_special_sym,
+    "code": valid_code,
+}
+
+
+# ─── Post-processing helpers ─────────────────────────────────────────────────
+
+
+_AI_VOCAB = [
+    "Сухое", "Полусухое", "Полусладкое", "Сладкое",
+    "2 по цене 1 от цены без карты",
+    "3 по цене 2 от цены без карты",
+    "Полусухое, Упс! Товар закончился. Уже везём!",
+    "Сухое, 3 по цене 2 от цены без карты",
+    "Сухое, доп. скидка для участников соц. программы",
+]
+
+
+def snap_additional_info(raw: str | None) -> str:
+    """Прижимает наш OCR-выход к ближайшему элементу закрытого словаря."""
+    if not raw or str(raw).strip().lower() in ("нет", "", "none"):
+        return "нет"
+    raw_norm = str(raw).strip()
+    for v in _AI_VOCAB:
+        if raw_norm in v or v.startswith(raw_norm):
+            return v
+    try:
+        from rapidfuzz import fuzz, process
+
+        result = process.extractOne(raw_norm, _AI_VOCAB, scorer=fuzz.token_set_ratio, score_cutoff=70)
+        return result[0] if result else "нет"
+    except Exception:
+        return raw_norm if raw_norm in _AI_VOCAB else "нет"
+
+
+_BLEED_TOKENS = re.compile(
+    r"(\s+\d+\s+по\s+цене\s+\d+.*|"
+    r"\s+(Сухое|Полусухое|Полусладкое|Сладкое)(\W.*)?$)",
+    re.IGNORECASE,
+)
+_VOLUME_ANCHOR = re.compile(r"(\d[\.,]\s*\d{1,2}\s*[Lл])", re.IGNORECASE)
+
+
+def canonical_product_name(raw: str | None) -> str:
+    if not raw or str(raw).strip() in ("", "нет"):
+        return "нет"
+    s = str(raw).strip()
+    m = _VOLUME_ANCHOR.search(s)
+    if m:
+        s = s[: m.end()].rstrip()
+    s = _BLEED_TOKENS.sub("", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    # GT-конвенция: '0.75L' → '0. 75L' (GT имеет 61 такой случай против 10 без пробела)
+    s = re.sub(r"(\d)\.(\d{2}[LМмл])", r"\1. \2", s)
+    return s if s else "нет"
+
+
+def to_dot(s: str | None) -> str | None:
+    if s is None:
+        return s
+    return str(s).replace(",", ".")
+
+
+def _load_db_codes(db_path: Path | None) -> set[str]:
+    """Загружает db_hack.csv (cp1251). Возвращает пустой set если файла нет."""
+    if db_path is None or not db_path.exists():
+        return set()
+    codes: set[str] = set()
+    try:
+        with db_path.open(encoding="cp1251") as f:
+            rdr = csv.reader(f, delimiter=";")
+            next(rdr, None)
+            for row in rdr:
+                if len(row) == 2:
+                    codes.add(row[1].strip())
+    except Exception:
+        return set()
+    return codes
+
+
+def _parse_price_value(s: str | None) -> float | None:
+    if not s or s == "нет":
+        return None
+    try:
+        return float(str(s).replace(",", "."))
+    except Exception:
+        return None
+
+
+def _parse_disc_value(s: str | None) -> int | None:
+    if not s or s == "нет":
+        return None
+    try:
+        return int(str(s).replace("%", "").replace("-", "").strip())
+    except Exception:
+        return None
+
+
+# ─── Main service classes ─────────────────────────────────────────────────────
+
+
+class FieldExtractor:
+    """Single-crop OCR + parser output. Returns a per-crop dict.
+
+    The processor calls this once per crop and aggregates results across the
+    top-K crops of each track (multi-frame consensus).
+    """
+
+    def __init__(self) -> None:
+        self._ocr = self._load_ocr()
+        self._zxing = self._load_zxing()
+        self._wechat_qr = self._load_wechat_qr()
+        self._cv_qr = None  # инициализируется лениво при первом вызове
+
+    @staticmethod
+    def _load_ocr():
+        try:
+            from paddleocr import PaddleOCR
+        except Exception:
+            return None
+        try:
+            return PaddleOCR(lang="ru", use_textline_orientation=True)
+        except TypeError:
+            return PaddleOCR(lang="ru", use_angle_cls=True)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _load_zxing():
+        try:
+            import zxingcpp
+        except Exception:
+            return None
+        return zxingcpp
+
+    @staticmethod
+    def _load_wechat_qr():
+        try:
+            import cv2
+
+            return cv2.wechat_qrcode_WeChatQRCode()
+        except Exception:
+            return None
+
+    def extract(self, crop) -> dict[str, Any]:
+        """Запускает OCR/zxing/QR на одном кропе и парсит поля."""
+        if crop is None or crop.size == 0:
+            return {}
+
+        lines = self._ocr_lines(crop)
+        zxing_bc = self._decode_barcode_1d(crop)
+        qr = self._decode_qr(crop)
+
+        if not lines and not zxing_bc and not qr:
+            return {}
+
+        bc = zxing_bc or parse_barcode(lines)
+
+        parsed: dict[str, Any] = {
+            "product_name": build_product_name(lines),
+            "barcode": bc,
+            "id_sku": parse_id_sku(lines, bc),
+            "print_datetime": parse_print_datetime(lines),
+            "discount_amount": parse_discount_amount_v2(lines),
+            "additional_info": parse_additional_info(lines),
+            "special_symbols": parse_special_symbols_v2(lines),
+        }
+        parsed.update(parse_prices_v2(lines))
+
+        # QR-поля идут сверху обычных — они достоверны
+        for k, v in qr.items():
+            if v not in (None, ""):
+                parsed[k] = v
+
+        return {k: v for k, v in parsed.items() if v not in (None, "")}
+
+    def _ocr_lines(self, crop) -> list[OcrLine]:
+        if self._ocr is None:
+            return []
+        try:
+            if hasattr(self._ocr, "predict"):
+                result = self._ocr.predict(crop)
+            else:
+                result = self._ocr.ocr(crop)
+        except Exception:
+            return []
+        return self._normalize_ocr_result(result)
+
+    @staticmethod
+    def _normalize_ocr_result(result) -> list[OcrLine]:
+        if not result:
+            return []
+        first = result[0]
+        if first is None:
+            return []
+        lines: list[OcrLine] = []
+        if isinstance(first, dict):
+            texts = first.get("rec_texts", [])
+            scores = first.get("rec_scores", [])
+            boxes = first.get("rec_boxes", first.get("rec_polys", []))
+            for text, score, box in zip(texts, scores, boxes):
+                normalized = FieldExtractor._line_from_box(text, score, box)
+                if normalized:
+                    lines.append(normalized)
+            return lines
+        for item in first or []:
+            try:
+                box, text_score = item[0], item[1]
+                text, score = text_score[0], text_score[1]
+            except Exception:
+                continue
+            normalized = FieldExtractor._line_from_box(text, score, box)
+            if normalized:
+                lines.append(normalized)
+        return lines
+
+    @staticmethod
+    def _line_from_box(text: str, score: float, box) -> OcrLine | None:
+        try:
+            points = list(box)
+            if len(points) == 4 and not isinstance(points[0], (list, tuple)):
+                x1, y1, x2, y2 = [float(v) for v in points]
+                return OcrLine(str(text), x1, y1, x2 - x1, y2 - y1, float(score))
+            xs = [float(p[0]) for p in points]
+            ys = [float(p[1]) for p in points]
+            x1, y1 = min(xs), min(ys)
+            return OcrLine(str(text), x1, y1, max(xs) - x1, max(ys) - y1, float(score))
+        except Exception:
+            return None
+
+    def _decode_barcode_1d(self, crop) -> str | None:
+        if self._zxing is None:
+            return None
+        try:
+            results = self._zxing.read_barcodes(crop)
+        except Exception:
+            return None
+        for r in results:
+            fmt = str(getattr(r, "format", "")).split(".")[-1]
+            if fmt in ("EAN13", "EAN8", "UPCA", "UPCE", "Code128", "Code39", "ITF"):
+                return r.text
+        return None
+
+    def _decode_qr(self, crop) -> dict[str, Any]:
+        """Пробует WeChat QR + cv2.QRCodeDetector с апскейлом ×2,3,4.
+        QR на ценнике ~80×80 px (2.7 px/модуль) — нужно апскейлить, чтобы достичь ≥4 px/модуль."""
+        try:
+            import cv2
+        except Exception:
+            return {}
+
+        payloads: list[str] = []
+
+        # WeChat (без апскейла)
+        if self._wechat_qr is not None:
+            try:
+                texts, _ = self._wechat_qr.detectAndDecode(crop)
+                payloads.extend([t for t in (texts or []) if t])
+            except Exception:
+                pass
+
+        # cv2 на исходном размере и ×2,3,4
+        if self._cv_qr is None:
+            self._cv_qr = cv2.QRCodeDetector()
+        height, width = crop.shape[:2]
+        for scale in (1, 2, 3, 4):
+            tgt = crop if scale == 1 else cv2.resize(
+                crop, (width * scale, height * scale), interpolation=cv2.INTER_CUBIC,
+            )
+            try:
+                data, _, _ = self._cv_qr.detectAndDecode(tgt)
+                if data:
+                    payloads.append(data)
+            except Exception:
+                continue
+
+        for payload in payloads:
+            parsed = parse_qr_payload(payload)
+            if parsed:
+                return parsed
+        return {}
+
+
+class PriceTagProcessor:
+    """End-to-end: video → submission rows.
+
+    Wraps YOLO+ByteTrack detection, multi-frame consensus, and post-processing.
+    Parameters mirror the FastAPI config so that the backend service can pass
+    runtime overrides without modifying the pipeline body.
     """
 
     def __init__(
@@ -115,6 +872,9 @@ class PriceTagProcessor:
         iou: float,
         imgsz: int,
         max_frames: int | None,
+        k_best: int = 5,
+        db_path: Path | None = None,
+        max_crop_side: int = 600,
     ) -> None:
         self.model_path = model_path
         self.device = _select_device(device)
@@ -122,21 +882,39 @@ class PriceTagProcessor:
         self.iou = iou
         self.imgsz = imgsz
         self.max_frames = max_frames
+        self.k_best = max(1, int(k_best))
+        self.db_path = db_path
+        self.max_crop_side = max_crop_side
         self._model = None
         self._field_extractor: FieldExtractor | None = None
+        self._db_codes: set[str] | None = None
 
     def process(self, video_path: Path, original_filename: str | None = None) -> ProcessingResult:
         start = time.perf_counter()
         video_id = Path(original_filename or video_path.name).stem
         tracks, frames_seen = self._track_price_tags(video_path)
 
-        rows = []
         field_extractor = self._get_field_extractor()
+        rows: list[dict[str, str]] = []
+        records: list[dict[str, Any]] = []
+
         for track_id in sorted(tracks, key=_track_sort_key):
-            row = _empty_submission_row(video_id=video_id, track_id=track_id)
-            crop = tracks[track_id].get("crop")
-            if crop is not None:
-                row.update(field_extractor.extract(crop))
+            crops = tracks[track_id]["crops"]
+            per_crop_fields = [field_extractor.extract(crop) for crop in crops]
+            aggregated = self._aggregate_fields(per_crop_fields)
+            records.append({"_track_id": track_id, **aggregated})
+
+        # Post-processing над всеми треками сразу (нужно для per-video code dedup)
+        self._post_process(records)
+
+        for r in records:
+            row = _empty_submission_row(video_id=video_id, track_id=r["_track_id"])
+            for col in SUBMISSION_COLUMNS:
+                if col in ("video", "track_id"):
+                    continue
+                v = r.get(col)
+                if v not in (None, "", "нет"):
+                    row[col] = str(v)
             rows.append(row)
 
         elapsed = time.perf_counter() - start
@@ -151,36 +929,38 @@ class PriceTagProcessor:
             device=self.device,
         )
 
+    # ── Tracking ──
+
     def _load_model(self):
         if self._model is not None:
             return self._model
         if not self.model_path.exists():
             raise PipelineError(f"YOLO weights not found: {self.model_path}")
-
         try:
             from ultralytics import YOLO
         except Exception as exc:
-            raise PipelineError(
-                "ultralytics is not installed; install services/backend/requirements.txt"
-            ) from exc
-
+            raise PipelineError("ultralytics is not installed") from exc
         self._model = YOLO(str(self.model_path))
         return self._model
 
-    def _get_field_extractor(self) -> "FieldExtractor":
+    def _get_field_extractor(self) -> FieldExtractor:
         if self._field_extractor is None:
             self._field_extractor = FieldExtractor()
         return self._field_extractor
+
+    def _get_db_codes(self) -> set[str]:
+        if self._db_codes is None:
+            self._db_codes = _load_db_codes(self.db_path)
+        return self._db_codes
 
     def _track_price_tags(self, video_path: Path) -> tuple[dict[Any, dict[str, Any]], int]:
         try:
             import cv2
         except Exception as exc:
-            raise PipelineError(
-                "opencv-python-headless is not installed; install backend requirements"
-            ) from exc
+            raise PipelineError("opencv-python-headless is not installed") from exc
 
         model = self._load_model()
+        # tracks[tid] = {'candidates': [(sharp, frame_idx, crop), ...] (top-K, sorted desc by sharpness)}
         tracks: dict[Any, dict[str, Any]] = {}
         frames_seen = 0
 
@@ -202,12 +982,10 @@ class PriceTagProcessor:
         for frame_idx, result in enumerate(results):
             if self.max_frames is not None and frame_idx >= self.max_frames:
                 break
-
             frames_seen += 1
             boxes = getattr(result, "boxes", None)
             if boxes is None or boxes.id is None:
                 continue
-
             frame = getattr(result, "orig_img", None)
             if frame is None:
                 continue
@@ -217,17 +995,24 @@ class PriceTagProcessor:
 
             for track_id, bbox in zip(track_ids, bboxes):
                 crop = self._crop_bbox(frame=frame, bbox=bbox)
+                if crop.size == 0:
+                    continue
                 sharpness = self._crop_sharpness(cv2=cv2, crop=crop)
-                current = tracks.get(track_id)
-                if current is None or sharpness > current["sharpness"]:
-                    tracks[track_id] = {
-                        "sharpness": sharpness,
-                        "frame_idx": frame_idx,
-                        "bbox": bbox,
-                        "crop": crop,
-                    }
+                crop_resized = self._resize_crop(cv2=cv2, crop=crop)
 
-        return tracks, frames_seen
+                bucket = tracks.setdefault(track_id, {"candidates": []})
+                bucket["candidates"].append((sharpness, frame_idx, crop_resized))
+                if len(bucket["candidates"]) > self.k_best:
+                    bucket["candidates"].sort(key=lambda c: c[0], reverse=True)
+                    del bucket["candidates"][self.k_best:]
+
+        # Финализируем: вытаскиваем сами кропы (отсортированные по убыванию sharpness)
+        finalized: dict[Any, dict[str, Any]] = {}
+        for tid, bucket in tracks.items():
+            bucket["candidates"].sort(key=lambda c: c[0], reverse=True)
+            finalized[tid] = {"crops": [c for _s, _f, c in bucket["candidates"]]}
+
+        return finalized, frames_seen
 
     @staticmethod
     def _crop_bbox(frame, bbox: list[float]):
@@ -243,405 +1028,110 @@ class PriceTagProcessor:
     def _crop_sharpness(cv2, crop) -> float:
         if crop.size == 0:
             return 0.0
-
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        return float(cv2.Laplacian(gray, cv2.CV_64F).var() * math.sqrt(gray.shape[0] * gray.shape[1]))
+        return float(
+            cv2.Laplacian(gray, cv2.CV_64F).var() * math.sqrt(gray.shape[0] * gray.shape[1])
+        )
 
+    def _resize_crop(self, cv2, crop):
+        h, w = crop.shape[:2]
+        longest = max(h, w)
+        if longest <= self.max_crop_side:
+            return crop
+        scale = self.max_crop_side / longest
+        return cv2.resize(crop, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
-class OcrLine(tuple):
-    __slots__ = ()
+    # ── Consensus + post-processing ──
 
-    def __new__(cls, text: str, x: float, y: float, w: float, h: float, conf: float):
-        return tuple.__new__(cls, (text, x, y, w, h, conf))
+    def _aggregate_fields(self, per_crop_fields: list[dict[str, Any]]) -> dict[str, Any]:
+        """Multi-frame consensus: Counter.most_common per field, проходя через валидатор."""
+        votes: dict[str, Counter] = defaultdict(Counter)
+        for fields in per_crop_fields:
+            for k, v in fields.items():
+                if v in (None, "", "нет"):
+                    continue
+                votes[k][v] += 1
 
-    @property
-    def text(self) -> str:
-        return self[0]
+        out: dict[str, Any] = {"color": "red"}  # color: 99% red в реальных данных Lenta
 
-    @property
-    def x(self) -> float:
-        return self[1]
-
-    @property
-    def y(self) -> float:
-        return self[2]
-
-    @property
-    def w(self) -> float:
-        return self[3]
-
-    @property
-    def h(self) -> float:
-        return self[4]
-
-    @property
-    def conf(self) -> float:
-        return self[5]
-
-
-def _cx(line: OcrLine) -> float:
-    return line.x + line.w / 2
-
-
-def _cy(line: OcrLine) -> float:
-    return line.y + line.h / 2
-
-
-def _ean13_checksum_ok(value: str) -> bool:
-    digits = re.sub(r"\D", "", value)
-    if len(digits) != 13:
-        return False
-    parsed = [int(char) for char in digits]
-    parity = sum(v * (3 if i % 2 else 1) for i, v in enumerate(parsed[:-1]))
-    return (10 - parity % 10) % 10 == parsed[-1]
-
-
-def _normalize_missing(value: Any) -> str:
-    if value is None:
-        return "нет"
-    value = str(value).strip()
-    return value if value else "нет"
-
-
-class FieldExtractor:
-    def __init__(self) -> None:
-        self._ocr = self._load_ocr()
-        self._zxing = self._load_zxing()
-        self._qr_detector = None
-
-    def extract(self, crop) -> dict[str, str]:
-        fields: dict[str, str] = {}
-        fields["color"] = self._detect_color(crop)
-
-        qr_fields = self._decode_qr(crop)
-        fields.update(qr_fields)
-
-        barcode = self._decode_barcode_1d(crop)
-        lines = self._ocr_lines(crop)
-        if not barcode:
-            barcode = self._parse_barcode(lines)
-
-        parsed = {
-            "product_name": self._build_product_name(lines),
-            "barcode": barcode,
-            "id_sku": self._parse_id_sku(lines, barcode),
-            "print_datetime": self._parse_print_datetime(lines),
-            "discount_amount": self._parse_discount_amount(lines),
-            "additional_info": self._parse_additional_info(lines),
-            "special_symbols": self._parse_special_symbols(lines),
-        }
-        parsed.update(self._parse_prices(lines))
-
-        for key, value in parsed.items():
-            if key in SUBMISSION_COLUMNS:
-                fields[key] = _normalize_missing(value)
-
-        return {key: value for key, value in fields.items() if value != "нет"}
-
-    @staticmethod
-    def _load_ocr():
-        try:
-            from paddleocr import PaddleOCR
-        except Exception:
-            return None
-
-        try:
-            return PaddleOCR(lang="ru", use_textline_orientation=True)
-        except TypeError:
-            return PaddleOCR(lang="ru", use_angle_cls=True)
-        except Exception:
-            return None
-
-    @staticmethod
-    def _load_zxing():
-        try:
-            import zxingcpp
-        except Exception:
-            return None
-        return zxingcpp
-
-    def _ocr_lines(self, crop) -> list[OcrLine]:
-        if self._ocr is None or crop is None or crop.size == 0:
-            return []
-        try:
-            if hasattr(self._ocr, "predict"):
-                result = self._ocr.predict(crop)
-            else:
-                result = self._ocr.ocr(crop)
-        except Exception:
-            return []
-        return self._normalize_ocr_result(result)
-
-    @staticmethod
-    def _normalize_ocr_result(result) -> list[OcrLine]:
-        if not result:
-            return []
-
-        first = result[0]
-        lines: list[OcrLine] = []
-        if isinstance(first, dict):
-            texts = first.get("rec_texts", [])
-            scores = first.get("rec_scores", [])
-            boxes = first.get("rec_boxes", first.get("rec_polys", []))
-            for text, score, box in zip(texts, scores, boxes):
-                normalized = FieldExtractor._line_from_box(text, score, box)
-                if normalized:
-                    lines.append(normalized)
-            return lines
-
-        for item in first or []:
-            try:
-                box, text_score = item[0], item[1]
-                text, score = text_score[0], text_score[1]
-            except Exception:
+        for field_name, counter in votes.items():
+            value, _count = counter.most_common(1)[0]
+            validator = VALIDATORS.get(field_name)
+            if validator is not None and not validator(value):
                 continue
-            normalized = FieldExtractor._line_from_box(text, score, box)
-            if normalized:
-                lines.append(normalized)
-        return lines
+            out[field_name] = value
 
-    @staticmethod
-    def _line_from_box(text: str, score: float, box) -> OcrLine | None:
-        try:
-            points = list(box)
-            if len(points) == 4 and not isinstance(points[0], (list, tuple)):
-                x1, y1, x2, y2 = [float(value) for value in points]
-                return OcrLine(str(text), x1, y1, x2 - x1, y2 - y1, float(score))
-            xs = [float(point[0]) for point in points]
-            ys = [float(point[1]) for point in points]
-            x1, y1 = min(xs), min(ys)
-            return OcrLine(str(text), x1, y1, max(xs) - x1, max(ys) - y1, float(score))
-        except Exception:
-            return None
-
-    def _decode_barcode_1d(self, crop) -> str | None:
-        if self._zxing is None or crop is None or crop.size == 0:
-            return None
-        try:
-            results = self._zxing.read_barcodes(crop)
-        except Exception:
-            return None
-        for item in results:
-            text = getattr(item, "text", "")
-            digits = re.sub(r"\D", "", text)
-            if len(digits) == 13 and _ean13_checksum_ok(digits):
-                return digits
-            if len(digits) in (8, 12):
-                return digits
-        return None
-
-    def _decode_qr(self, crop) -> dict[str, str]:
-        try:
-            import cv2
-        except Exception:
-            return {}
-        if crop is None or crop.size == 0:
-            return {}
-        if self._qr_detector is None:
-            self._qr_detector = cv2.QRCodeDetector()
-
-        payloads: list[str] = []
-        try:
-            data, _, _ = self._qr_detector.detectAndDecode(crop)
-            if data:
-                payloads.append(data)
-        except Exception:
-            pass
-
-        height, width = crop.shape[:2]
-        for scale in (2, 3, 4):
-            try:
-                resized = cv2.resize(crop, (width * scale, height * scale), interpolation=cv2.INTER_CUBIC)
-                data, _, _ = self._qr_detector.detectAndDecode(resized)
-                if data:
-                    payloads.append(data)
-            except Exception:
-                continue
-
-        for payload in payloads:
-            parsed = self._parse_qr_payload(payload)
-            if parsed:
-                return parsed
-        return {}
-
-    @staticmethod
-    def _parse_qr_payload(payload: str) -> dict[str, str]:
-        key_map = {
-            "b": "qr_code_barcode",
-            "barcode": "qr_code_barcode",
-            "p1": "price1_qr",
-            "price1": "price1_qr",
-            "p2": "price2_qr",
-            "price2": "price2_qr",
-            "p3": "price3_qr",
-            "price3": "price3_qr",
-            "p4": "price4_qr",
-            "price4": "price4_qr",
-            "wL1C": "wholesale_level_1_count",
-            "wholesaleLevel1Count": "wholesale_level_1_count",
-            "wL1P": "wholesale_level_1_price",
-            "wholesaleLevel1Price": "wholesale_level_1_price",
-            "wL2C": "wholesale_level_2_count",
-            "wholesaleLevel2Count": "wholesale_level_2_count",
-            "wL2P": "wholesale_level_2_price",
-            "wholesaleLevel2Price": "wholesale_level_2_price",
-            "aP": "action_price_qr",
-            "actionPrice": "action_price_qr",
-            "aC": "action_code_qr",
-            "actionCode": "action_code_qr",
-        }
-        out: dict[str, str] = {}
-        for part in re.split(r"[&;,\n]", payload):
-            match = re.match(r"\s*([A-Za-z0-9_]+)\s*[=:]\s*(.*?)\s*$", part)
-            if not match:
-                continue
-            field = key_map.get(match.group(1))
-            if field:
-                out[field] = _normalize_missing(match.group(2))
         return out
 
-    @staticmethod
-    def _detect_color(crop) -> str:
-        try:
-            import cv2
-        except Exception:
-            return "нет"
-        if crop is None or crop.size == 0:
-            return "нет"
-        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        red1 = cv2.inRange(hsv, (0, 70, 50), (12, 255, 255))
-        red2 = cv2.inRange(hsv, (170, 70, 50), (180, 255, 255))
-        yellow = cv2.inRange(hsv, (18, 55, 80), (42, 255, 255))
-        red_score = int((red1 > 0).sum() + (red2 > 0).sum())
-        yellow_score = int((yellow > 0).sum())
-        if red_score < 50 and yellow_score < 50:
-            return "нет"
-        return "yellow" if yellow_score > red_score else "red"
+    def _post_process(self, records: list[dict[str, Any]]) -> None:
+        """Применяет фильтры и трансформации над всем списком треков.
 
-    @staticmethod
-    def _parse_barcode(lines: list[OcrLine]) -> str | None:
-        candidates: list[tuple[str, float]] = []
-        for line in lines:
-            for digits in re.findall(r"\d{8,14}", re.sub(r"\D", "", line.text)):
-                valid_bonus = 2.0 if len(digits) == 13 and _ean13_checksum_ok(digits) else 0.0
-                candidates.append((digits, len(digits) + line.conf + valid_bonus))
-        if not candidates:
-            return None
-        candidates.sort(key=lambda item: -item[1])
-        return candidates[0][0]
+        1. DB sanity filter — barcode не из db_hack.csv → 'нет'
+        2. price_default validator — integer вне диапазона по (price_card, discount) → 'нет'
+        3. additional_info snap к закрытому словарю
+        4. product_name canonicalize (volume-anchor + bleed-in + space norm)
+        5. QR mirror — копируем price_default/price_card/barcode в QR-поля
+        6. Per-video code dedup — если одно значение code доминирует >40% треков → 'нет'
+        """
+        db_codes = self._get_db_codes()
 
-    @staticmethod
-    def _parse_id_sku(lines: list[OcrLine], barcode: str | None) -> str | None:
-        if not lines:
-            return None
-        height = max(line.y + line.h for line in lines)
-        candidates: list[tuple[str, float]] = []
-        for line in lines:
-            if _cy(line) / max(height, 1) < 0.3:
+        # 1. DB filter
+        if db_codes:
+            for r in records:
+                bc = r.get("barcode")
+                if bc and bc not in db_codes:
+                    r["barcode"] = None
+
+        # 2. price_default validator (требует price_card + discount_amount)
+        for r in records:
+            pd_str = r.get("price_default")
+            if not pd_str:
                 continue
-            for digits in re.findall(r"\d{8,12}", re.sub(r"\D", "", line.text)):
-                if barcode and (digits == barcode or digits in barcode or barcode in digits):
-                    continue
-                candidates.append((digits, line.conf + _cy(line) / max(height, 1)))
-        if not candidates:
-            return None
-        candidates.sort(key=lambda item: -item[1])
-        return candidates[0][0]
-
-    @staticmethod
-    def _parse_print_datetime(lines: list[OcrLine]) -> str | None:
-        digit_fix = str.maketrans({"З": "3", "з": "3", "O": "0", "o": "0", "О": "0", "о": "0", "I": "1", "l": "1", "B": "8", "В": "8"})
-        full_re = re.compile(r"(\d{2})[.\-/](\d{2})[.\-/](\d{4})[\D]+(\d{1,2})[:.]\s*(\d{2})")
-        date_re = re.compile(r"(\d{2})[.\-/](\d{2})[.\-/](\d{4})")
-        for line in lines:
-            text = line.text.translate(digit_fix)
-            match = full_re.search(text)
-            if match:
-                day, month, year, hour, minute = match.groups()
-                return f"{day}.{month}.{year} {int(hour)}:{minute}"
-        for line in lines:
-            text = line.text.translate(digit_fix)
-            match = date_re.search(text)
-            if match:
-                day, month, year = match.groups()
-                return f"{day}.{month}.{year}"
-        return None
-
-    @staticmethod
-    def _parse_discount_amount(lines: list[OcrLine]) -> str | None:
-        best: tuple[int, float] | None = None
-        for line in lines:
-            match = re.search(r"[-−–—]?\s*(\d{1,2})\s*%", line.text)
-            if match and 1 <= int(match.group(1)) <= 99:
-                if best is None or line.h > best[1]:
-                    best = (int(match.group(1)), line.h)
-        return f"-{best[0]}%" if best else None
-
-    @staticmethod
-    def _parse_prices(lines: list[OcrLine]) -> dict[str, str | None]:
-        price_re = re.compile(r"(\d{1,5})[,.\s]+(\d{2})\b")
-        candidates: list[tuple[float, OcrLine]] = []
-        for line in lines:
-            text = line.text.translate(str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹", "0123456789"))
-            if re.search(r"\d{1,2}\s*%", text):
+            pd_val = _parse_price_value(pd_str)
+            pc_val = _parse_price_value(r.get("price_card"))
+            d_pct = _parse_disc_value(r.get("discount_amount"))
+            if pd_val is None or pc_val is None or not d_pct:
                 continue
-            match = price_re.search(text)
-            if match:
-                value = int(match.group(1)) + int(match.group(2)) / 100
-                if value >= 10:
-                    candidates.append((value, line))
-                    continue
-            runs = re.findall(r"\d+", text)
-            if runs:
-                value = int(max(runs, key=len))
-                if value >= 100:
-                    candidates.append((float(value), line))
+            try:
+                low = pc_val / (1 - d_pct / 100.0)
+                high = pc_val / (1 - (d_pct + 1) / 100.0)
+            except ZeroDivisionError:
+                continue
+            pd_int = int(pd_val)
+            if not (int(low) - 1 <= pd_int < int(high) + 1):
+                r["price_default"] = None
 
-        if not candidates:
-            return {"price_default": None, "price_card": None}
+        # 3. additional_info snap
+        for r in records:
+            v = r.get("additional_info")
+            if v:
+                snapped = snap_additional_info(v)
+                r["additional_info"] = snapped if snapped != "нет" else None
 
-        ordered = sorted(candidates, key=lambda item: -item[1].h)
-        card = ordered[0][0]
-        out = {"price_default": None, "price_card": f"{int(card) + 0.99:.2f}".replace(".", ",")}
-        card_int = int(card)
-        for value, _line in ordered[1:]:
-            if int(value) != card_int:
-                out["price_default"] = f"{value:.2f}".replace(".", ",")
-                break
-        return out
+        # 4. product_name canonicalize
+        for r in records:
+            v = r.get("product_name")
+            if v:
+                canon = canonical_product_name(v)
+                r["product_name"] = canon if canon != "нет" else None
 
-    @staticmethod
-    def _build_product_name(lines: list[OcrLine]) -> str | None:
-        if not lines:
-            return None
-        height = max(line.y + line.h for line in lines)
-        top = [
-            line
-            for line in lines
-            if _cy(line) < height * 0.55
-            and any(char.isalpha() for char in line.text)
-            and not re.search(r"\d{1,5}[,.\s]\d{2}", line.text)
-            and "%" not in line.text
-        ]
-        top.sort(key=lambda line: (line.y, line.x))
-        name = " ".join(line.text.strip() for line in top if len(line.text.strip()) >= 2)
-        return name if len(name) >= 5 else None
+        # 5. QR mirror — после всех предыдущих фильтров.
+        # GT-конвенция: price_X с запятой, price_X_qr с точкой. barcode/qr_code_barcode — одинаковые.
+        for r in records:
+            if r.get("price_default"):
+                r["price1_qr"] = to_dot(r["price_default"])
+            if r.get("price_card"):
+                r["price4_qr"] = to_dot(r["price_card"])
+            if r.get("barcode"):
+                r["qr_code_barcode"] = r["barcode"]
 
-    @staticmethod
-    def _parse_additional_info(lines: list[OcrLine]) -> str | None:
-        hints = ("Полусладкое", "Полусухое", "Сладкое", "Сухое", "Игристое", "Шипучее", "Десертное", "по цене", "Удачная упаковка")
-        text = " ".join(line.text for line in lines).lower()
-        for hint in hints:
-            if hint.lower() in text:
-                return hint
-        return None
-
-    @staticmethod
-    def _parse_special_symbols(lines: list[OcrLine]) -> str | None:
-        for line in lines:
-            token = line.text.strip()
-            if token in {"К", "к", "K", "k"}:
-                return "К"
-            if token in {"Ш", "ш"}:
-                return "Ш"
-        return None
+        # 6. Per-video code dedup (видео в нашем случае одно — все треки)
+        non_net = [r for r in records if r.get("code")]
+        if len(non_net) >= 10:
+            code_counts = Counter(r["code"] for r in non_net)
+            total = len(non_net)
+            for code_val, cnt in code_counts.items():
+                if cnt / total > 0.40:
+                    for r in non_net:
+                        if r.get("code") == code_val:
+                            r["code"] = None
