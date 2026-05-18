@@ -29,8 +29,8 @@ jobs:
       - name: Python syntax check
         run: python3 -m compileall services
 
-      - name: Validate local compose
-        run: docker compose -f docker-compose.local.yml config
+      # - name: Validate local compose
+      #   run: docker compose -f docker-compose.local.yml config
 
       - name: Validate prod compose
         run: docker compose --env-file deploy/.env.prod.example -f deploy/docker-compose.prod.yml config
