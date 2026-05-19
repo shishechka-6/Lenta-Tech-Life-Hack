@@ -13,6 +13,9 @@ paddleocr>=3.0                # PP-OCRv5 (ru)
 paddlepaddle>=3.0             # backend для PaddleOCR (arm64 macOS / Linux CPU)
 zxing-cpp>=2.2                # 1D штрихкоды (EAN-13/Code128)
 
+# Text matching
+rapidfuzz>=3.6                # additional_info snap, product_name fuzzy match
+
 # Notebooks
 jupyter>=1.1
 nbformat>=5.10
