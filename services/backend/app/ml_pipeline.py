@@ -876,15 +876,22 @@ class FieldExtractor:
 
     @staticmethod
     def _line_from_box(text: str, score: float, box) -> OcrLine | None:
+        """Поддерживает оба формата:
+        - rec_boxes: shape (4,) — [x1, y1, x2, y2]
+        - rec_polys: shape (4, 2) или (N, 2) — список точек [[x, y], ...]
+        np.asarray(box).reshape(-1, 2) приводит к единому виду (M, 2), дальше min/max.
+        """
         try:
-            points = list(box)
-            if len(points) == 4 and not isinstance(points[0], (list, tuple)):
-                x1, y1, x2, y2 = [float(v) for v in points]
-                return OcrLine(str(text), x1, y1, x2 - x1, y2 - y1, float(score))
-            xs = [float(p[0]) for p in points]
-            ys = [float(p[1]) for p in points]
-            x1, y1 = min(xs), min(ys)
-            return OcrLine(str(text), x1, y1, max(xs) - x1, max(ys) - y1, float(score))
+            import numpy as np
+
+            arr = np.asarray(box, dtype=float).reshape(-1, 2)
+            if arr.size == 0:
+                return None
+            x1 = float(arr[:, 0].min())
+            y1 = float(arr[:, 1].min())
+            x2 = float(arr[:, 0].max())
+            y2 = float(arr[:, 1].max())
+            return OcrLine(str(text), x1, y1, x2 - x1, y2 - y1, float(score))
         except Exception:
             return None
 
