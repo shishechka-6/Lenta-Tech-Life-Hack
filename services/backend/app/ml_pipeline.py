@@ -999,8 +999,8 @@ class PriceTagProcessor:
         video_id = Path(original_filename or video_path.name).stem
         report("preprocess", "Подготовка видео", 10)
 
-        report("yolo", "YOLO трекинг ценников", 25)
-        tracks, frames_seen = self._track_price_tags(video_path)
+        report("yolo", "YOLO 0%: трекинг ценников", 25)
+        tracks, frames_seen = self._track_price_tags(video_path, progress_callback=report)
         report("yolo", f"YOLO завершен: {len(tracks)} треков, {frames_seen} кадров", 55)
 
         report("ocr", "Загрузка OCR и декодеров", 60)
@@ -1008,14 +1008,17 @@ class PriceTagProcessor:
         if not field_extractor.ocr_available:
             raise PipelineError("PaddleOCR is not available; check backend logs for paddleocr_import/init_failed")
         field_extractor.stats.clear()
-        report("ocr", f"OCR по трекам: {len(tracks)}", 65)
+        sorted_track_ids = sorted(tracks, key=_track_sort_key)
+        total_tracks = len(sorted_track_ids)
+        report("ocr", f"OCR 0%: треков {total_tracks}", 65)
 
         rows: list[dict[str, str]] = []
         records: list[dict[str, Any]] = []
         parsed_tracks = 0
         field_counts: Counter = Counter()
+        last_ocr_progress = 65
 
-        for track_id in sorted(tracks, key=_track_sort_key):
+        for idx, track_id in enumerate(sorted_track_ids, start=1):
             crops = tracks[track_id]["crops"]
             per_crop_fields = [field_extractor.extract(crop) for crop in crops]
             aggregated = self._aggregate_fields(per_crop_fields)
@@ -1024,6 +1027,16 @@ class PriceTagProcessor:
                 parsed_tracks += 1
                 field_counts.update(meaningful_fields.keys())
             records.append({"_track_id": track_id, **aggregated})
+            if total_tracks:
+                stage_pct = int(idx * 100 / total_tracks)
+                overall_progress = 65 + int(stage_pct * 20 / 100)
+                if overall_progress > last_ocr_progress:
+                    last_ocr_progress = overall_progress
+                    report(
+                        "ocr",
+                        f"OCR {stage_pct}%: трек {idx}/{total_tracks}, распарсилось {parsed_tracks}",
+                        overall_progress,
+                    )
         stats = dict(field_extractor.stats)
         logger.info(
             "ocr_summary tracks=%s parsed_tracks=%s stats=%s fields=%s",
@@ -1093,7 +1106,11 @@ class PriceTagProcessor:
             self._db_codes = _load_db_codes(self.db_path)
         return self._db_codes
 
-    def _track_price_tags(self, video_path: Path) -> tuple[dict[Any, dict[str, Any]], int]:
+    def _track_price_tags(
+        self,
+        video_path: Path,
+        progress_callback: ProgressCallback | None = None,
+    ) -> tuple[dict[Any, dict[str, Any]], int]:
         try:
             import cv2
         except Exception as exc:
@@ -1103,6 +1120,12 @@ class PriceTagProcessor:
         # tracks[tid] = {'candidates': [(sharp, frame_idx, crop), ...] (top-K, sorted desc by sharpness)}
         tracks: dict[Any, dict[str, Any]] = {}
         frames_seen = 0
+        total_frames = self._video_frame_count(cv2=cv2, video_path=video_path)
+        if self.max_frames is not None:
+            total_frames = min(total_frames, self.max_frames) if total_frames else self.max_frames
+        last_yolo_progress = 25
+        if progress_callback is not None and total_frames:
+            progress_callback("yolo", f"YOLO 0%: 0/{total_frames} кадров", 25)
 
         try:
             results = model.track(
@@ -1123,6 +1146,16 @@ class PriceTagProcessor:
             if self.max_frames is not None and frame_idx >= self.max_frames:
                 break
             frames_seen += 1
+            if progress_callback is not None and total_frames:
+                stage_pct = min(99, int(frames_seen * 100 / total_frames))
+                overall_progress = 25 + int(stage_pct * 30 / 100)
+                if overall_progress > last_yolo_progress:
+                    last_yolo_progress = overall_progress
+                    progress_callback(
+                        "yolo",
+                        f"YOLO {stage_pct}%: кадр {frames_seen}/{total_frames}, треков {len(tracks)}",
+                        overall_progress,
+                    )
             boxes = getattr(result, "boxes", None)
             if boxes is None or boxes.id is None:
                 continue
@@ -1153,6 +1186,16 @@ class PriceTagProcessor:
             finalized[tid] = {"crops": [c for _s, _f, c in bucket["candidates"]]}
 
         return finalized, frames_seen
+
+    @staticmethod
+    def _video_frame_count(cv2, video_path: Path) -> int:
+        cap = cv2.VideoCapture(str(video_path))
+        try:
+            if not cap.isOpened():
+                return 0
+            return max(0, int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0))
+        finally:
+            cap.release()
 
     @staticmethod
     def _crop_bbox(frame, bbox: list[float]):
