@@ -711,6 +711,8 @@ class FieldExtractor:
         except Exception as exc:
             logger.exception("paddleocr_import_failed error=%s", exc)
             return None
+        # PaddleOCR 3.x на CPU с oneDNN/PIR падает с NotImplementedError
+        # (ConvertPirAttribute2RuntimeAttribute). Отключаем mkldnn для надёжности.
         try:
             logger.info("paddleocr_init_start")
             ocr = PaddleOCR(
@@ -718,17 +720,32 @@ class FieldExtractor:
                 use_doc_orientation_classify=False,
                 use_doc_unwarping=False,
                 use_textline_orientation=False,
+                enable_mkldnn=False,
             )
             logger.info("paddleocr_init_done")
             return ocr
         except TypeError:
             try:
-                logger.info("paddleocr_init_start legacy_args=true")
-                ocr = PaddleOCR(lang="ru", use_angle_cls=False)
-                logger.info("paddleocr_init_done legacy_args=true")
+                logger.info("paddleocr_init_start fallback=no_mkldnn_kw")
+                ocr = PaddleOCR(
+                    lang="ru",
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    use_textline_orientation=False,
+                )
+                logger.info("paddleocr_init_done fallback=no_mkldnn_kw")
                 return ocr
+            except TypeError:
+                try:
+                    logger.info("paddleocr_init_start legacy_args=true")
+                    ocr = PaddleOCR(lang="ru", use_angle_cls=False, enable_mkldnn=False)
+                    logger.info("paddleocr_init_done legacy_args=true")
+                    return ocr
+                except Exception as exc:
+                    logger.exception("paddleocr_init_failed legacy_args=true error=%s", exc)
+                    return None
             except Exception as exc:
-                logger.exception("paddleocr_init_failed legacy_args=true error=%s", exc)
+                logger.exception("paddleocr_init_failed fallback error=%s", exc)
                 return None
         except Exception as exc:
             logger.exception("paddleocr_init_failed error=%s", exc)
