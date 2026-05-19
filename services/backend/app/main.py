@@ -58,6 +58,7 @@ class JobState:
     error: str | None = None
     result: ProcessingResult | None = None
     result_path: Path | None = None
+    debug_path: Path | None = None
 
 
 def get_processor() -> PriceTagProcessor:
@@ -76,11 +77,13 @@ def get_processor() -> PriceTagProcessor:
 
 @app.get("/health")
 def health() -> dict[str, object]:
+    storage_writable = _storage_writable()
     return {
-        "status": "ok",
+        "status": "ok" if storage_writable else "degraded",
         "model_path": str(settings.model_path),
         "model_exists": settings.model_path.exists(),
         "storage_dir": str(settings.storage_dir),
+        "storage_writable": storage_writable,
         "device": settings.device,
     }
 
@@ -236,6 +239,7 @@ def _save_upload(file: UploadFile, job_id: str | None = None) -> Path:
 
 def _run_job(job_id: str, upload_path: Path, original_filename: str) -> None:
     started = time.perf_counter()
+    debug_path = upload_path.parent / "debug"
     logger.info("job=%s event=processing_start path=%s", job_id, upload_path)
 
     def progress_callback(stage: str, message: str, progress: int) -> None:
@@ -252,6 +256,7 @@ def _run_job(job_id: str, upload_path: Path, original_filename: str) -> None:
             upload_path,
             original_filename=original_filename,
             progress_callback=progress_callback,
+            debug_dir=debug_path,
         )
         result_path = _write_job_csv(job_id, result.csv_text)
     except PipelineError as exc:
@@ -284,6 +289,7 @@ def _run_job(job_id: str, upload_path: Path, original_filename: str) -> None:
             progress=100,
             result=result,
             result_path=result_path,
+            debug_path=debug_path,
         )
         logger.info(
             "job=%s event=processing_done seconds=%.3f rows=%s tracks=%s frames=%s",
@@ -294,7 +300,7 @@ def _run_job(job_id: str, upload_path: Path, original_filename: str) -> None:
             result.frames_seen,
         )
     finally:
-        shutil.rmtree(upload_path.parent, ignore_errors=True)
+        _cleanup_job_upload(upload_path)
 
 
 def _put_job(job: JobState) -> None:
@@ -308,6 +314,7 @@ def _get_job(job_id: str) -> JobState:
     if job is None:
         result_path = _job_csv_path(job_id)
         if result_path.exists():
+            debug_path = settings.storage_dir / job_id / "debug"
             return JobState(
                 job_id=job_id,
                 filename=result_path.name,
@@ -316,6 +323,7 @@ def _get_job(job_id: str) -> JobState:
                 message="Готово",
                 progress=100,
                 result_path=result_path,
+                debug_path=debug_path if debug_path.exists() else None,
             )
         raise HTTPException(status_code=404, detail="job not found")
     return job
@@ -347,6 +355,7 @@ def _job_response(job_id: str) -> dict[str, object]:
 
 def _job_snapshot(job: JobState) -> dict[str, object]:
     has_result_file = job.result_path is not None and job.result_path.exists()
+    has_debug = job.debug_path is not None and job.debug_path.exists()
     return {
         "job_id": job.job_id,
         "filename": job.filename,
@@ -359,6 +368,8 @@ def _job_snapshot(job: JobState) -> dict[str, object]:
         "error": job.error,
         "has_result": job.result is not None or has_result_file,
         "result_filename": f"{job.job_id}.csv" if has_result_file else None,
+        "has_debug": has_debug,
+        "debug_path": str(job.debug_path) if has_debug else None,
     }
 
 
@@ -377,7 +388,7 @@ def _result_payload(result: ProcessingResult) -> dict[str, object]:
 
 
 def _csv_result_payload(csv_text: str) -> dict[str, object]:
-    reader = csv.DictReader(io.StringIO(csv_text))
+    reader = csv.DictReader(io.StringIO(csv_text), delimiter=";")
     rows = list(reader)
     columns = reader.fieldnames or []
     return {
@@ -403,3 +414,28 @@ def _write_job_csv(job_id: str, csv_text: str) -> Path:
     result_path.write_text(csv_text, encoding="utf-8")
     logger.info("job=%s event=result_saved path=%s", job_id, result_path)
     return result_path
+
+
+def _cleanup_job_upload(upload_path: Path) -> None:
+    try:
+        upload_path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("upload_cleanup_failed path=%s error=%s", upload_path, exc)
+    try:
+        next(upload_path.parent.iterdir())
+    except StopIteration:
+        shutil.rmtree(upload_path.parent, ignore_errors=True)
+    except OSError:
+        pass
+
+
+def _storage_writable() -> bool:
+    try:
+        settings.storage_dir.mkdir(parents=True, exist_ok=True)
+        probe_path = settings.storage_dir / ".healthcheck-write-test"
+        probe_path.write_text("ok", encoding="utf-8")
+        probe_path.unlink(missing_ok=True)
+        return True
+    except OSError as exc:
+        logger.warning("storage_dir_not_writable path=%s error=%s", settings.storage_dir, exc)
+        return False

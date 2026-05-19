@@ -14,7 +14,7 @@ Pipeline stages:
     2. Top-K sharpest keyframes per track (Laplacian variance × √area).
     3. Per-crop FieldExtractor — PaddleOCR + zxing-cpp + QR decoders + parsers.
     4. Multi-frame consensus — Counter.most_common per field.
-    5. Post-processing — DB sanity filter, QR mirror, validators, canonicalisation.
+    5. Post-processing — DB sanity filter, validators, canonicalisation.
 
 The pipeline intentionally drops the VLM second-pass (Qwen2.5-VL on Kaggle
 T4×2 takes ~5h); for an interactive backend this is not viable. Quality on
@@ -79,6 +79,29 @@ QR_FIELDS = (
     "action_price_qr", "action_code_qr",
 )
 
+TRACK_SIGNAL_FIELDS = (
+    "product_name",
+    "price_default",
+    "price_card",
+    "barcode",
+    "discount_amount",
+    "id_sku",
+    "print_datetime",
+    "code",
+    "additional_info",
+    "qr_code_barcode",
+    "price1_qr",
+    "price2_qr",
+    "price3_qr",
+    "price4_qr",
+    "wholesale_level_1_count",
+    "wholesale_level_1_price",
+    "wholesale_level_2_count",
+    "wholesale_level_2_price",
+    "action_price_qr",
+    "action_code_qr",
+)
+
 
 # ─── Exceptions and DTOs
 
@@ -117,6 +140,32 @@ def _empty_submission_row(video_id: str, track_id: Any) -> dict[str, str]:
     row["video"] = video_id
     row["track_id"] = str(track_id)
     return row
+
+
+def _line_to_dict(line: OcrLine) -> dict[str, object]:
+    return {
+        "text": line.text,
+        "x": float(line.x),
+        "y": float(line.y),
+        "w": float(line.w),
+        "h": float(line.h),
+        "conf": float(line.conf),
+    }
+
+
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _json_ready(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(v) for v in value]
+    if isinstance(value, Path):
+        return str(value)
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return value
 
 
 def _track_sort_key(track_id: Any) -> tuple[int, Any]:
@@ -344,10 +393,17 @@ def parse_additional_info(lines: list[OcrLine]) -> str | None:
 
 # Price parsing (v2)
 
-_PRICE_INLINE_RE = re.compile(r"(\d{1,5})[,.\s]+(\d{2})\b")
+MIN_PRICE_VALUE = 10.0
+MAX_PRICE_VALUE = 9999.99
+
+_PRICE_INLINE_RE = re.compile(r"(?<!\d)(\d{1,4})[,.\s]+(\d{2})\b")
 _SOURCE_PRIORITY = {"inline": 0, "pair": 1, "int-only": 2}
 _MIN_DX_PX = 80
 _MIN_DY_PX = 35
+
+
+def _is_plausible_price_value(value: float) -> bool:
+    return MIN_PRICE_VALUE <= value <= MAX_PRICE_VALUE
 
 
 def _extract_integer(text: str) -> int | None:
@@ -363,7 +419,7 @@ def _extract_integer(text: str) -> int | None:
     if s[idx + len(longest): idx + len(longest) + 1] == "%":
         return None
     v = int(longest)
-    return v if 10 <= v <= 99999 else None
+    return v if _is_plausible_price_value(float(v)) else None
 
 
 def _try_inline_price(text: str) -> float | None:
@@ -371,7 +427,7 @@ def _try_inline_price(text: str) -> float | None:
     if not m:
         return None
     v = int(m.group(1)) + int(m.group(2)) / 100.0
-    return v if v >= 10 else None
+    return v if _is_plausible_price_value(v) else None
 
 
 def _fmt_price_ru(v: float) -> str:
@@ -416,7 +472,7 @@ def _candidate_prices_v2(lines: list[OcrLine]) -> list[tuple[float, OcrLine, str
 
 
 def parse_prices_v2(lines: list[OcrLine]) -> dict[str, str | None]:
-    """price_card (всегда ,99) + price_default (force ,99 для int-only)."""
+    """Extract price_card + optional price_default from OCR layout candidates."""
     out: dict[str, str | None] = {"price_default": None, "price_card": None}
     cands = _candidate_prices_v2(lines)
     if not cands:
@@ -428,7 +484,8 @@ def parse_prices_v2(lines: list[OcrLine]) -> dict[str, str | None]:
             best_by_line[key] = (v, L, src)
     ordered = sorted(best_by_line.values(), key=lambda c: -c[1].h)
     if ordered:
-        out["price_card"] = _fmt_price_ru(int(ordered[0][0]) + 0.99)
+        v, _line, src = ordered[0]
+        out["price_card"] = _fmt_price_ru(int(v) + 0.99 if src == "int-only" else v)
     if len(ordered) > 1:
         card_int = int(ordered[0][0])
         for v, L, src in ordered[1:]:
@@ -533,7 +590,7 @@ def valid_price(s: str | None) -> bool:
         return False
     try:
         f = float(str(s).replace(",", "."))
-        return 10.0 <= f <= 99999.0
+        return _is_plausible_price_value(f)
     except Exception:
         return False
 
@@ -635,12 +692,6 @@ def canonical_product_name(raw: str | None) -> str:
     return s if s else "нет"
 
 
-def to_dot(s: str | None) -> str | None:
-    if s is None:
-        return s
-    return str(s).replace(",", ".")
-
-
 def _load_db_codes(db_path: Path | None) -> set[str]:
     """Загружает db_hack.csv (cp1251). Возвращает пустой set если файла нет."""
     if db_path is None or not db_path.exists():
@@ -674,6 +725,38 @@ def _parse_disc_value(s: str | None) -> int | None:
         return int(str(s).replace("%", "").replace("-", "").strip())
     except Exception:
         return None
+
+
+def _sanitize_record_prices(record: dict[str, Any]) -> None:
+    for field in ("price_default", "price_card"):
+        value = record.get(field)
+        if value and not valid_price(str(value)):
+            record[field] = None
+
+    pd_val = _parse_price_value(record.get("price_default"))
+    pc_val = _parse_price_value(record.get("price_card"))
+    discount = _parse_disc_value(record.get("discount_amount"))
+
+    if pd_val is not None and pc_val is not None:
+        if pd_val <= pc_val * 1.03 or pd_val > pc_val * 4.0:
+            record["price_default"] = None
+            pd_val = None
+
+    if pd_val is not None and pc_val is not None and discount:
+        try:
+            expected_default = pc_val / (1 - discount / 100.0)
+        except ZeroDivisionError:
+            return
+        if expected_default and abs(pd_val - expected_default) / expected_default > 0.12:
+            record["price_default"] = None
+
+
+def _record_has_signal(record: dict[str, Any]) -> bool:
+    return any(record.get(field) not in (None, "", "нет") for field in TRACK_SIGNAL_FIELDS)
+
+
+def _safe_file_part(value: Any) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value))[:80] or "unknown"
 
 
 # ─── Main service classes ─────────────────────────────────────────────────────
@@ -769,15 +852,30 @@ class FieldExtractor:
             return None
 
     def extract(self, crop) -> dict[str, Any]:
+        result, _debug = self.extract_with_debug(crop)
+        return result
+
+    def extract_with_debug(self, crop) -> tuple[dict[str, Any], dict[str, Any]]:
         """Запускает OCR/zxing/QR на одном кропе и парсит поля."""
         self.stats["crops_seen"] += 1
+        debug: dict[str, Any] = {
+            "crop_shape": list(crop.shape) if crop is not None and hasattr(crop, "shape") else None,
+            "ocr_lines": [],
+            "zxing_barcode": None,
+            "qr": {},
+            "parsed": {},
+        }
         if crop is None or crop.size == 0:
             self.stats["empty_crops"] += 1
-            return {}
+            debug["empty_crop"] = True
+            return {}, debug
 
         lines = self._ocr_lines(crop)
         zxing_bc = self._decode_barcode_1d(crop)
         qr = self._decode_qr(crop)
+        debug["ocr_lines"] = [_line_to_dict(line) for line in lines]
+        debug["zxing_barcode"] = zxing_bc
+        debug["qr"] = qr
         if lines:
             self.stats["ocr_crops_with_text"] += 1
             self.stats["ocr_lines"] += len(lines)
@@ -787,7 +885,7 @@ class FieldExtractor:
             self.stats["qr_crops"] += 1
 
         if not lines and not zxing_bc and not qr:
-            return {}
+            return {}, debug
 
         bc = zxing_bc or parse_barcode(lines)
 
@@ -808,9 +906,10 @@ class FieldExtractor:
                 parsed[k] = v
 
         result = {k: v for k, v in parsed.items() if v not in (None, "")}
+        debug["parsed"] = result
         if result:
             self.stats["parsed_crops"] += 1
-        return result
+        return result, debug
 
     def _ocr_lines(self, crop) -> list[OcrLine]:
         if self._ocr is None:
@@ -1003,6 +1102,7 @@ class PriceTagProcessor:
         video_path: Path,
         original_filename: str | None = None,
         progress_callback: ProgressCallback | None = None,
+        debug_dir: Path | None = None,
     ) -> ProcessingResult:
         def report(stage: str, message: str, progress: int) -> None:
             if progress_callback is None:
@@ -1031,19 +1131,42 @@ class PriceTagProcessor:
 
         rows: list[dict[str, str]] = []
         records: list[dict[str, Any]] = []
+        debug_tracks: list[dict[str, Any]] = []
+        if debug_dir is not None:
+            debug_dir.mkdir(parents=True, exist_ok=True)
         parsed_tracks = 0
         field_counts: Counter = Counter()
         last_ocr_progress = 65
 
         for idx, track_id in enumerate(sorted_track_ids, start=1):
             crops = tracks[track_id]["crops"]
-            per_crop_fields = [field_extractor.extract(crop) for crop in crops]
+            per_crop_fields: list[dict[str, Any]] = []
+            crop_debugs: list[dict[str, Any]] = []
+            for crop_idx, crop in enumerate(crops):
+                if debug_dir is None:
+                    per_crop_fields.append(field_extractor.extract(crop))
+                    continue
+                fields, crop_debug = field_extractor.extract_with_debug(crop)
+                crop_debug["crop_path"] = self._write_debug_crop(debug_dir, track_id, crop_idx, crop)
+                per_crop_fields.append(fields)
+                crop_debugs.append(crop_debug)
             aggregated = self._aggregate_fields(per_crop_fields)
             meaningful_fields = {k: v for k, v in aggregated.items() if k != "color"}
             if meaningful_fields:
                 parsed_tracks += 1
                 field_counts.update(meaningful_fields.keys())
             records.append({"_track_id": track_id, **aggregated})
+            if debug_dir is not None:
+                debug_tracks.append(
+                    {
+                        "track_id": str(track_id),
+                        "candidate_meta": tracks[track_id].get("candidate_meta", []),
+                        "crop_count": len(crops),
+                        "crops": crop_debugs,
+                        "per_crop_fields": per_crop_fields,
+                        "aggregated_before_postprocess": aggregated,
+                    }
+                )
             if total_tracks:
                 stage_pct = int(idx * 100 / total_tracks)
                 overall_progress = 65 + int(stage_pct * 20 / 100)
@@ -1075,6 +1198,30 @@ class PriceTagProcessor:
         # Post-processing над всеми треками сразу (нужно для per-video code dedup)
         report("postprocess", "Постобработка результата", 92)
         self._post_process(records)
+        postprocessed_records = [dict(record) for record in records]
+        records_before_filter = len(records)
+        records = [r for r in records if _record_has_signal(r)]
+        filtered_tracks = records_before_filter - len(records)
+        if filtered_tracks:
+            logger.info(
+                "track_filter before=%s after=%s filtered=%s",
+                records_before_filter,
+                len(records),
+                filtered_tracks,
+            )
+        if debug_dir is not None:
+            try:
+                self._write_debug_payload(
+                    debug_dir=debug_dir,
+                    debug_tracks=debug_tracks,
+                    postprocessed_records=postprocessed_records,
+                    kept_records=records,
+                    stats=stats,
+                    frames_seen=frames_seen,
+                    filtered_tracks=filtered_tracks,
+                )
+            except Exception:
+                logger.exception("debug_payload_write_failed path=%s", debug_dir)
 
         for r in records:
             row = _empty_submission_row(video_id=video_id, track_id=r["_track_id"])
@@ -1122,6 +1269,67 @@ class PriceTagProcessor:
         if self._db_codes is None:
             self._db_codes = _load_db_codes(self.db_path)
         return self._db_codes
+
+    @staticmethod
+    def _write_debug_crop(debug_dir: Path, track_id: Any, crop_idx: int, crop) -> str | None:
+        try:
+            import cv2
+        except Exception:
+            return None
+        crops_dir = debug_dir / "crops"
+        crops_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"track_{_safe_file_part(track_id)}_crop_{crop_idx:02d}.jpg"
+        path = crops_dir / filename
+        try:
+            if crop is None or crop.size == 0:
+                return None
+            ok = cv2.imwrite(str(path), crop)
+            return str(path.relative_to(debug_dir)) if ok else None
+        except Exception as exc:
+            logger.warning("debug_crop_write_failed path=%s error=%s", path, exc)
+            return None
+
+    @staticmethod
+    def _write_debug_payload(
+        debug_dir: Path,
+        debug_tracks: list[dict[str, Any]],
+        postprocessed_records: list[dict[str, Any]],
+        kept_records: list[dict[str, Any]],
+        stats: dict[str, Any],
+        frames_seen: int,
+        filtered_tracks: int,
+    ) -> None:
+        final_by_track = {str(r.get("_track_id")): r for r in postprocessed_records}
+        kept_track_ids = {str(r.get("_track_id")) for r in kept_records}
+        for track in debug_tracks:
+            track_id = str(track.get("track_id"))
+            track["kept_in_csv"] = track_id in kept_track_ids
+            track["final_record"] = final_by_track.get(track_id)
+            track_path = debug_dir / f"track_{_safe_file_part(track.get('track_id'))}.json"
+            track_path.write_text(
+                json.dumps(_json_ready(track), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+        summary = {
+            "frames_seen": frames_seen,
+            "tracks_seen": len(debug_tracks),
+            "tracks_kept": len(kept_records),
+            "tracks_filtered": filtered_tracks,
+            "ocr_stats": stats,
+        }
+        (debug_dir / "summary.json").write_text(
+            json.dumps(_json_ready(summary), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (debug_dir / "records.json").write_text(
+            json.dumps(_json_ready(kept_records), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (debug_dir / "records_all_postprocessed.json").write_text(
+            json.dumps(_json_ready(postprocessed_records), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
     def _track_price_tags(
         self,
@@ -1200,7 +1408,13 @@ class PriceTagProcessor:
         finalized: dict[Any, dict[str, Any]] = {}
         for tid, bucket in tracks.items():
             bucket["candidates"].sort(key=lambda c: c[0], reverse=True)
-            finalized[tid] = {"crops": [c for _s, _f, c in bucket["candidates"]]}
+            finalized[tid] = {
+                "crops": [c for _s, _f, c in bucket["candidates"]],
+                "candidate_meta": [
+                    {"sharpness": float(sharpness), "frame_idx": int(frame_idx)}
+                    for sharpness, frame_idx, _crop in bucket["candidates"]
+                ],
+            }
 
         return finalized, frames_seen
 
@@ -1267,11 +1481,10 @@ class PriceTagProcessor:
         """Применяет фильтры и трансформации над всем списком треков.
 
         1. DB sanity filter — barcode не из db_hack.csv → 'нет'
-        2. price_default validator — integer вне диапазона по (price_card, discount) → 'нет'
+        2. price sanity — выбросы и невозможные пары price_default/price_card → 'нет'
         3. additional_info snap к закрытому словарю
         4. product_name canonicalize (volume-anchor + bleed-in + space norm)
-        5. QR mirror — копируем price_default/price_card/barcode в QR-поля
-        6. Per-video code dedup — если одно значение code доминирует >40% треков → 'нет'
+        5. Per-video code dedup — если одно значение code доминирует >40% треков → 'нет'
         """
         db_codes = self._get_db_codes()
 
@@ -1282,8 +1495,9 @@ class PriceTagProcessor:
                 if bc and bc not in db_codes:
                     r["barcode"] = None
 
-        # 2. price_default validator (требует price_card + discount_amount)
+        # 2. Price sanity filters.
         for r in records:
+            _sanitize_record_prices(r)
             pd_str = r.get("price_default")
             if not pd_str:
                 continue
@@ -1315,17 +1529,7 @@ class PriceTagProcessor:
                 canon = canonical_product_name(v)
                 r["product_name"] = canon if canon != "нет" else None
 
-        # 5. QR mirror — после всех предыдущих фильтров.
-        # GT-конвенция: price_X с запятой, price_X_qr с точкой. barcode/qr_code_barcode — одинаковые.
-        for r in records:
-            if r.get("price_default"):
-                r["price1_qr"] = to_dot(r["price_default"])
-            if r.get("price_card"):
-                r["price4_qr"] = to_dot(r["price_card"])
-            if r.get("barcode"):
-                r["qr_code_barcode"] = r["barcode"]
-
-        # 6. Per-video code dedup (видео в нашем случае одно — все треки)
+        # 5. Per-video code dedup (видео в нашем случае одно — все треки)
         non_net = [r for r in records if r.get("code")]
         if len(non_net) >= 10:
             code_counts = Counter(r["code"] for r in non_net)

@@ -41,8 +41,8 @@ COPY services/__init__.py /app/services/__init__.py
 COPY services/backend/__init__.py /app/services/backend/__init__.py
 COPY services/backend/app /app/services/backend/app
 
-RUN mkdir -p /models /cache/ultralytics /cache/paddlex /cache/paddleocr /cache/paddle \
-    && chown -R app:app /app /home/app /cache
+RUN mkdir -p /models /data/jobs /cache/ultralytics /cache/paddlex /cache/paddleocr /cache/paddle \
+    && chown -R app:app /app /home/app /data/jobs /cache
 
 ENV PYTHONPATH=/app \
     LENTA_MODEL_PATH=/models/best.pt \
