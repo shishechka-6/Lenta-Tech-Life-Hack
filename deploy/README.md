@@ -59,6 +59,10 @@ Backend пишет стадии обработки в stdout. Для живой 
 docker compose --env-file deploy/.env.prod -f deploy/docker-compose.prod.yml logs -f backend
 ```
 
+CSV-результаты асинхронных задач сохраняются backend-ом в named volume `backend-job-storage`
+с именами вида `<job_id>.csv`. Это позволяет заново открыть страницу job-а и скачать результат
+после завершения обработки.
+
 ## GitHub Actions
 
 Workflow `.github/workflows/deploy.yml` запускается на каждый push в ветку `deploy`:

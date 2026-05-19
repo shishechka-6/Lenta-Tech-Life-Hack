@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import io
 import logging
 import shutil
 import time
@@ -55,6 +57,7 @@ class JobState:
     updated_at: float = field(default_factory=time.time)
     error: str | None = None
     result: ProcessingResult | None = None
+    result_path: Path | None = None
 
 
 def get_processor() -> PriceTagProcessor:
@@ -132,9 +135,13 @@ def get_job_result(job_id: str) -> dict[str, object]:
     job = _get_job(job_id)
     if job.status == "failed":
         raise HTTPException(status_code=422, detail=job.error or "job failed")
-    if job.status != "completed" or job.result is None:
+    if job.status != "completed":
         raise HTTPException(status_code=409, detail="job is not completed yet")
-    return _result_payload(job.result)
+    if job.result is not None:
+        return _result_payload(job.result)
+    if job.result_path is not None and job.result_path.exists():
+        return _csv_result_payload(job.result_path.read_text(encoding="utf-8"))
+    raise HTTPException(status_code=404, detail="result csv not found")
 
 
 @app.get("/api/v1/jobs/{job_id}/result.csv")
@@ -142,10 +149,18 @@ def get_job_result_csv(job_id: str) -> Response:
     job = _get_job(job_id)
     if job.status == "failed":
         raise HTTPException(status_code=422, detail=job.error or "job failed")
-    if job.status != "completed" or job.result is None:
+    if job.status != "completed":
         raise HTTPException(status_code=409, detail="job is not completed yet")
 
-    filename = f"{Path(job.filename or 'submission').stem}_submission.csv"
+    filename = f"{job_id}.csv"
+    if job.result_path is not None and job.result_path.exists():
+        return Response(
+            content=job.result_path.read_text(encoding="utf-8"),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    if job.result is None:
+        raise HTTPException(status_code=404, detail="result csv not found")
     return Response(
         content=job.result.csv_text,
         media_type="text/csv; charset=utf-8",
@@ -238,6 +253,7 @@ def _run_job(job_id: str, upload_path: Path, original_filename: str) -> None:
             original_filename=original_filename,
             progress_callback=progress_callback,
         )
+        result_path = _write_job_csv(job_id, result.csv_text)
     except PipelineError as exc:
         _update_job(
             job_id,
@@ -267,6 +283,7 @@ def _run_job(job_id: str, upload_path: Path, original_filename: str) -> None:
             message="Готово",
             progress=100,
             result=result,
+            result_path=result_path,
         )
         logger.info(
             "job=%s event=processing_done seconds=%.3f rows=%s tracks=%s frames=%s",
@@ -289,6 +306,17 @@ def _get_job(job_id: str) -> JobState:
     with _jobs_lock:
         job = _jobs.get(job_id)
     if job is None:
+        result_path = _job_csv_path(job_id)
+        if result_path.exists():
+            return JobState(
+                job_id=job_id,
+                filename=result_path.name,
+                status="completed",
+                stage="completed",
+                message="Готово",
+                progress=100,
+                result_path=result_path,
+            )
         raise HTTPException(status_code=404, detail="job not found")
     return job
 
@@ -318,6 +346,7 @@ def _job_response(job_id: str) -> dict[str, object]:
 
 
 def _job_snapshot(job: JobState) -> dict[str, object]:
+    has_result_file = job.result_path is not None and job.result_path.exists()
     return {
         "job_id": job.job_id,
         "filename": job.filename,
@@ -328,7 +357,8 @@ def _job_snapshot(job: JobState) -> dict[str, object]:
         "created_at": job.created_at,
         "updated_at": job.updated_at,
         "error": job.error,
-        "has_result": job.result is not None,
+        "has_result": job.result is not None or has_result_file,
+        "result_filename": f"{job.job_id}.csv" if has_result_file else None,
     }
 
 
@@ -344,3 +374,32 @@ def _result_payload(result: ProcessingResult) -> dict[str, object]:
         "model_path": result.model_path,
         "device": result.device,
     }
+
+
+def _csv_result_payload(csv_text: str) -> dict[str, object]:
+    reader = csv.DictReader(io.StringIO(csv_text))
+    rows = list(reader)
+    columns = reader.fieldnames or []
+    return {
+        "columns": columns,
+        "rows": rows,
+        "csv": csv_text,
+        "row_count": len(rows),
+        "tracks_detected": len(rows),
+        "frames_seen": None,
+        "processing_seconds": None,
+        "model_path": str(settings.model_path),
+        "device": settings.device,
+    }
+
+
+def _job_csv_path(job_id: str) -> Path:
+    return settings.storage_dir / f"{job_id}.csv"
+
+
+def _write_job_csv(job_id: str, csv_text: str) -> Path:
+    settings.storage_dir.mkdir(parents=True, exist_ok=True)
+    result_path = _job_csv_path(job_id)
+    result_path.write_text(csv_text, encoding="utf-8")
+    logger.info("job=%s event=result_saved path=%s", job_id, result_path)
+    return result_path
