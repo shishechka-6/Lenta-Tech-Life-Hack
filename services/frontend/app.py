@@ -65,7 +65,7 @@ def render_sidebar() -> None:
         st.caption("Backend")
         st.code(BACKEND_URL, language="text")
 
-        if st.button("Healthcheck", use_container_width=True):
+        if st.button("Healthcheck", width="stretch"):
             try:
                 response = requests.get(f"{BACKEND_URL}/health", timeout=10)
                 response.raise_for_status()
@@ -75,7 +75,7 @@ def render_sidebar() -> None:
 
         st.divider()
         reattach_job_id = st.text_input("Job ID", placeholder="Вставьте job_id")
-        if st.button("Открыть job", use_container_width=True, disabled=not reattach_job_id.strip()):
+        if st.button("Открыть job", width="stretch", disabled=not reattach_job_id.strip()):
             open_job(reattach_job_id.strip())
 
 
@@ -87,7 +87,7 @@ def render_upload_view() -> None:
         "Обработать",
         type="primary",
         disabled=uploaded_file is None,
-        use_container_width=False,
+        width="content",
     )
 
     if not process_clicked or uploaded_file is None:
@@ -139,7 +139,7 @@ def render_stage_table(job: dict[str, object]) -> None:
             stage_status = "ожидает"
         rows.append({"Этап": STAGE_LABELS.get(stage, stage), "Статус": stage_status})
 
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 
 def render_result(job_id: str) -> None:
@@ -160,7 +160,7 @@ def render_result(job_id: str) -> None:
     middle.metric("Треков", result.get("tracks_detected", 0))
     right.metric("Секунд", result.get("processing_seconds") or "-")
 
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.dataframe(df, width="stretch", hide_index=True)
     st.download_button(
         "Скачать CSV",
         data=str(result.get("csv", "")).encode("utf-8"),
@@ -173,9 +173,9 @@ def render_job_view(job_id: str) -> None:
     st.title("Обработка видео")
 
     left, middle, right = st.columns([1, 1, 4])
-    if left.button("Refresh", type="primary", use_container_width=True):
+    if left.button("Refresh", type="primary", width="stretch"):
         st.rerun()
-    if middle.button("Новая загрузка", use_container_width=True):
+    if middle.button("Новая загрузка", width="stretch"):
         open_upload_view()
 
     st.caption(f"job_id: {job_id}")
