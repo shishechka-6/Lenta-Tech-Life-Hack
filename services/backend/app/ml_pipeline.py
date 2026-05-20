@@ -79,30 +79,6 @@ QR_FIELDS = (
     "action_price_qr", "action_code_qr",
 )
 
-TRACK_SIGNAL_FIELDS = (
-    "product_name",
-    "price_default",
-    "price_card",
-    "barcode",
-    "discount_amount",
-    "id_sku",
-    "print_datetime",
-    "code",
-    "additional_info",
-    "qr_code_barcode",
-    "price1_qr",
-    "price2_qr",
-    "price3_qr",
-    "price4_qr",
-    "wholesale_level_1_count",
-    "wholesale_level_1_price",
-    "wholesale_level_2_count",
-    "wholesale_level_2_price",
-    "action_price_qr",
-    "action_code_qr",
-)
-
-
 # ─── Exceptions and DTOs
 
 
@@ -434,11 +410,19 @@ def _price_line_allowed(line: OcrLine, crop_height: float, median_line_h: float)
     return True
 
 
+_NON_PRODUCT_TEXT_RE = re.compile(
+    r"(прилож|возраст|подтверд|здесь\s+можно|через|минут)",
+    re.IGNORECASE,
+)
+
+
 def _product_name_looks_plausible(text: str | None) -> bool:
     if not text:
         return False
     s = str(text).strip()
     if not s or _has_discount_marker(s) or _try_inline_price(s):
+        return False
+    if _NON_PRODUCT_TEXT_RE.search(s.translate(LATIN_TO_CYR_HINTS)):
         return False
     letters = _ALPHA_RE.findall(s)
     digits = _digits_only(s)
@@ -817,8 +801,25 @@ def _sanitize_record_prices(record: dict[str, Any]) -> None:
             record["price_default"] = None
 
 
+CORE_TRACK_SIGNAL_FIELDS = (
+    "price_default",
+    "price_card",
+    "price_discount",
+    "barcode",
+    "id_sku",
+    "qr_code_barcode",
+    "price1_qr",
+    "price2_qr",
+    "price3_qr",
+    "price4_qr",
+    "wholesale_level_1_price",
+    "wholesale_level_2_price",
+    "action_price_qr",
+)
+
+
 def _record_has_signal(record: dict[str, Any]) -> bool:
-    return any(record.get(field) not in (None, "", "нет") for field in TRACK_SIGNAL_FIELDS)
+    return any(record.get(field) not in (None, "", "нет") for field in CORE_TRACK_SIGNAL_FIELDS)
 
 
 def _price_preference(value: Any) -> tuple[int, float]:
@@ -1043,8 +1044,8 @@ class FieldExtractor:
             img = crop
             h, w = img.shape[:2]
             longest = max(h, w)
-            if longest and longest < 700:
-                scale = min(1.5, 700 / longest)
+            if longest and longest < 850:
+                scale = min(1.35, 850 / longest)
                 img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
             blur = cv2.GaussianBlur(img, (0, 0), 1.0)
             return cv2.addWeighted(img, 1.45, blur, -0.45, 0)
@@ -1247,7 +1248,7 @@ class PriceTagProcessor:
         iou: float,
         imgsz: int,
         max_frames: int | None,
-        k_best: int = 1,
+        k_best: int = 2,
         db_path: Path | None = None,
         max_crop_side: int = 768,
         min_track_detections: int = 2,
