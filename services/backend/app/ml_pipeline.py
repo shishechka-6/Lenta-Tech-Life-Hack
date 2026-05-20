@@ -393,10 +393,11 @@ def parse_additional_info(lines: list[OcrLine]) -> str | None:
 
 # Price parsing (v2)
 
-MIN_PRICE_VALUE = 10.0
+MIN_PRICE_VALUE = 99.0
 MAX_PRICE_VALUE = 9999.99
 
 _PRICE_INLINE_RE = re.compile(r"(?<!\d)(\d{1,4})[,.\s]+(\d{2})\b")
+_ALPHA_RE = re.compile(r"[A-Za-zА-Яа-я]")
 _SOURCE_PRIORITY = {"inline": 0, "pair": 1, "int-only": 2}
 _MIN_DX_PX = 80
 _MIN_DY_PX = 35
@@ -406,7 +407,56 @@ def _is_plausible_price_value(value: float) -> bool:
     return MIN_PRICE_VALUE <= value <= MAX_PRICE_VALUE
 
 
+def _has_discount_marker(text: str) -> bool:
+    s = text.translate(SUPER_TRANS).strip()
+    return "%" in s or bool(re.fullmatch(r"[-−–—]\s*\d{1,2}", s))
+
+
+def _digits_only(text: str) -> str:
+    return re.sub(r"\D", "", text.translate(SUPER_TRANS))
+
+
+def _looks_numeric_price_line(text: str) -> bool:
+    s = text.translate(SUPER_TRANS).strip()
+    if not s or _has_discount_marker(s):
+        return False
+    if _ALPHA_RE.search(s):
+        return False
+    digits = _digits_only(s)
+    return 2 <= len(digits) <= 6
+
+
+def _price_line_allowed(line: OcrLine, crop_height: float, median_line_h: float) -> bool:
+    if not _looks_numeric_price_line(line.text):
+        return False
+    if cy(line) < crop_height * 0.25 and line.h < median_line_h * 1.35:
+        return False
+    return True
+
+
+def _product_name_looks_plausible(text: str | None) -> bool:
+    if not text:
+        return False
+    s = str(text).strip()
+    if not s or _has_discount_marker(s) or _try_inline_price(s):
+        return False
+    letters = _ALPHA_RE.findall(s)
+    digits = _digits_only(s)
+    if len(letters) < 4:
+        return False
+    if len(letters) < 7 and not _VOLUME_ANCHOR.search(s):
+        return False
+    if re.fullmatch(r"[\d\s.,/()]+[LlЛлМм]?", s):
+        return False
+    if len(digits) > max(6, len(letters) * 3):
+        return False
+    allowed = sum(ch.isalnum() or ch.isspace() or ch in ".,()/+-'\"" for ch in s)
+    return allowed / max(len(s), 1) >= 0.65
+
+
 def _extract_integer(text: str) -> int | None:
+    if not _looks_numeric_price_line(text):
+        return None
     s = text.translate(SUPER_TRANS).strip()
     if re.fullmatch(r"[-−–—]?\s*\d{1,2}\s*%?", s):
         if "%" in s or re.fullmatch(r"[-−–—]\s*\d{1,2}", s):
@@ -423,6 +473,8 @@ def _extract_integer(text: str) -> int | None:
 
 
 def _try_inline_price(text: str) -> float | None:
+    if not _looks_numeric_price_line(text):
+        return None
     m = _PRICE_INLINE_RE.search(text.translate(SUPER_TRANS))
     if not m:
         return None
@@ -436,14 +488,22 @@ def _fmt_price_ru(v: float) -> str:
 
 def _candidate_prices_v2(lines: list[OcrLine]) -> list[tuple[float, OcrLine, str]]:
     cands: list[tuple[float, OcrLine, str]] = []
-    for L in lines:
+    if not lines:
+        return cands
+    crop_height = max(L.y + L.h for L in lines)
+    heights = sorted(max(float(L.h), 1.0) for L in lines)
+    median_line_h = heights[len(heights) // 2]
+    price_lines = [L for L in lines if _price_line_allowed(L, crop_height, median_line_h)]
+    for L in price_lines:
         v = _try_inline_price(L.text)
         if v is not None:
             cands.append((v, L, "inline"))
-    integers = [(v, L) for L in lines if (v := _extract_integer(L.text)) is not None]
+    integers = [(v, L) for L in price_lines if (v := _extract_integer(L.text)) is not None]
     decimals: list[tuple[int, OcrLine]] = []
-    for L in lines:
+    for L in price_lines:
         s = L.text.translate(SUPER_TRANS).strip()
+        if _has_discount_marker(s) or _ALPHA_RE.search(s):
+            continue
         m = re.fullmatch(r"[^\d]*(\d{2})[^\d]*", s)
         if m:
             decimals.append((int(m.group(1)), L))
@@ -509,14 +569,13 @@ def build_product_name(lines: list[OcrLine]) -> str | None:
     top = [
         L for L in lines
         if cy(L) < height * 0.55
-        and any(c.isalpha() for c in L.text)
-        and len(L.text.strip()) >= 2
+        and _product_name_looks_plausible(L.text)
     ]
     if not top:
         return None
     top.sort(key=lambda L: (L.y, L.x))
     name = " ".join(L.text.strip() for L in top)
-    return name if len(name) >= 5 else None
+    return name if _product_name_looks_plausible(name) else None
 
 
 def normalize_product_name(s: str | None) -> str:
@@ -689,7 +748,7 @@ def canonical_product_name(raw: str | None) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     # GT-конвенция: '0.75L' → '0. 75L' (GT имеет 61 такой случай против 10 без пробела)
     s = re.sub(r"(\d)\.(\d{2}[LМмл])", r"\1. \2", s)
-    return s if s else "нет"
+    return s if _product_name_looks_plausible(s) else "нет"
 
 
 def _load_db_codes(db_path: Path | None) -> set[str]:
@@ -737,6 +796,13 @@ def _sanitize_record_prices(record: dict[str, Any]) -> None:
     pc_val = _parse_price_value(record.get("price_card"))
     discount = _parse_disc_value(record.get("discount_amount"))
 
+    if pc_val is not None and discount:
+        record["price_card"] = _fmt_price_ru(int(pc_val) + 0.99)
+        pc_val = _parse_price_value(record.get("price_card"))
+    if pd_val is not None:
+        record["price_default"] = _fmt_price_ru(int(pd_val) + 0.99)
+        pd_val = _parse_price_value(record.get("price_default"))
+
     if pd_val is not None and pc_val is not None:
         if pd_val <= pc_val * 1.03 or pd_val > pc_val * 4.0:
             record["price_default"] = None
@@ -753,6 +819,36 @@ def _sanitize_record_prices(record: dict[str, Any]) -> None:
 
 def _record_has_signal(record: dict[str, Any]) -> bool:
     return any(record.get(field) not in (None, "", "нет") for field in TRACK_SIGNAL_FIELDS)
+
+
+def _price_preference(value: Any) -> tuple[int, float]:
+    price = _parse_price_value(str(value))
+    cents = int(round((price - int(price)) * 100)) if price is not None else -1
+    return (1 if cents == 99 else 0, -(price or 0.0))
+
+
+def _product_name_preference(value: Any) -> tuple[int, int]:
+    text = str(value)
+    alpha_count = len(_ALPHA_RE.findall(text))
+    return (alpha_count, min(len(text), 120))
+
+
+def _select_counter_value(field_name: str, counter: Counter) -> Any:
+    items = list(counter.items())
+    if field_name in ("price_default", "price_card"):
+        value, _count = max(
+            items,
+            key=lambda item: (item[1], *_price_preference(item[0])),
+        )
+        return value
+    if field_name == "product_name":
+        value, _count = max(
+            items,
+            key=lambda item: (item[1], *_product_name_preference(item[0])),
+        )
+        return value
+    value, _count = counter.most_common(1)[0]
+    return value
 
 
 def _safe_file_part(value: Any) -> str:
@@ -915,10 +1011,11 @@ class FieldExtractor:
         if self._ocr is None:
             return []
         try:
+            ocr_crop = self._prepare_ocr_crop(crop)
             if hasattr(self._ocr, "predict"):
-                result = self._ocr.predict(crop)
+                result = self._ocr.predict(ocr_crop)
             else:
-                result = self._ocr.ocr(crop)
+                result = self._ocr.ocr(ocr_crop)
         except Exception as exc:
             self.stats["ocr_errors"] += 1
             if not self._ocr_error_logged:
@@ -926,6 +1023,22 @@ class FieldExtractor:
                 self._ocr_error_logged = True
             return []
         return self._normalize_ocr_result(result)
+
+    @staticmethod
+    def _prepare_ocr_crop(crop):
+        try:
+            import cv2
+
+            img = crop
+            h, w = img.shape[:2]
+            longest = max(h, w)
+            if longest and longest < 900:
+                scale = min(2.0, 900 / longest)
+                img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+            blur = cv2.GaussianBlur(img, (0, 0), 1.0)
+            return cv2.addWeighted(img, 1.45, blur, -0.45, 0)
+        except Exception:
+            return crop
 
     @staticmethod
     def _normalize_ocr_result(result) -> list[OcrLine]:
@@ -1015,13 +1128,19 @@ class FieldExtractor:
         if self._zxing is None:
             return None
         try:
-            results = self._zxing.read_barcodes(crop)
+            import cv2
         except Exception:
-            return None
-        for r in results:
-            fmt = str(getattr(r, "format", "")).split(".")[-1]
-            if fmt in ("EAN13", "EAN8", "UPCA", "UPCE", "Code128", "Code39", "ITF"):
-                return r.text
+            cv2 = None
+        for roi in self._decode_rois(crop):
+            for image in self._decode_image_variants(roi, cv2=cv2, scales=(1, 2, 3)):
+                try:
+                    results = self._zxing.read_barcodes(image)
+                except Exception:
+                    continue
+                for r in results:
+                    fmt = str(getattr(r, "format", "")).split(".")[-1]
+                    if fmt in ("EAN13", "EAN8", "UPCA", "UPCE", "Code128", "Code39", "ITF"):
+                        return r.text
         return None
 
     def _decode_qr(self, crop) -> dict[str, Any]:
@@ -1034,34 +1153,69 @@ class FieldExtractor:
 
         payloads: list[str] = []
 
-        # WeChat (без апскейла)
-        if self._wechat_qr is not None:
-            try:
-                texts, _ = self._wechat_qr.detectAndDecode(crop)
-                payloads.extend([t for t in (texts or []) if t])
-            except Exception:
-                pass
-
-        # cv2 на исходном размере и ×2,3,4
         if self._cv_qr is None:
             self._cv_qr = cv2.QRCodeDetector()
-        height, width = crop.shape[:2]
-        for scale in (1, 2, 3, 4):
-            tgt = crop if scale == 1 else cv2.resize(
-                crop, (width * scale, height * scale), interpolation=cv2.INTER_CUBIC,
-            )
-            try:
-                data, _, _ = self._cv_qr.detectAndDecode(tgt)
-                if data:
-                    payloads.append(data)
-            except Exception:
-                continue
+        for roi in self._decode_rois(crop):
+            for image in self._decode_image_variants(roi, cv2=cv2, scales=(1, 2, 3, 4)):
+                if self._wechat_qr is not None:
+                    try:
+                        texts, _ = self._wechat_qr.detectAndDecode(image)
+                        payloads.extend([t for t in (texts or []) if t])
+                    except Exception:
+                        pass
+                try:
+                    data, _, _ = self._cv_qr.detectAndDecode(image)
+                    if data:
+                        payloads.append(data)
+                except Exception:
+                    continue
 
         for payload in payloads:
             parsed = parse_qr_payload(payload)
             if parsed:
                 return parsed
         return {}
+
+    @staticmethod
+    def _decode_rois(crop) -> list[Any]:
+        h, w = crop.shape[:2]
+        rois = [crop]
+        slices = (
+            (0.45, 1.0, 0.0, 1.0),   # lower half: barcode/date/code often live here
+            (0.55, 1.0, 0.0, 1.0),
+            (0.35, 1.0, 0.50, 1.0),  # right/lower areas: QR is often on the right
+            (0.50, 1.0, 0.50, 1.0),
+            (0.35, 0.85, 0.0, 0.55),
+        )
+        for y1f, y2f, x1f, x2f in slices:
+            y1, y2 = int(h * y1f), int(h * y2f)
+            x1, x2 = int(w * x1f), int(w * x2f)
+            roi = crop[y1:y2, x1:x2]
+            if roi.size:
+                rois.append(roi)
+        return rois
+
+    @staticmethod
+    def _decode_image_variants(image, cv2, scales: tuple[int, ...]):
+        yield image
+        if cv2 is None:
+            return
+        try:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+            yield gray
+            yield cv2.equalizeHist(gray)
+            _threshold, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            yield binary
+            h, w = image.shape[:2]
+            for scale in scales:
+                if scale == 1:
+                    continue
+                size = (w * scale, h * scale)
+                yield cv2.resize(image, size, interpolation=cv2.INTER_CUBIC)
+                yield cv2.resize(gray, size, interpolation=cv2.INTER_CUBIC)
+                yield cv2.resize(binary, size, interpolation=cv2.INTER_NEAREST)
+        except Exception:
+            return
 
 
 class PriceTagProcessor:
@@ -1082,7 +1236,7 @@ class PriceTagProcessor:
         max_frames: int | None,
         k_best: int = 5,
         db_path: Path | None = None,
-        max_crop_side: int = 600,
+        max_crop_side: int = 1000,
     ) -> None:
         self.model_path = model_path
         self.device = _select_device(device)
@@ -1432,6 +1586,12 @@ class PriceTagProcessor:
     def _crop_bbox(frame, bbox: list[float]):
         height, width = frame.shape[:2]
         x1, y1, x2, y2 = bbox
+        pad_x = (x2 - x1) * 0.06
+        pad_y = (y2 - y1) * 0.06
+        x1 -= pad_x
+        x2 += pad_x
+        y1 -= pad_y
+        y2 += pad_y
         x1c = max(0, min(width, int(x1)))
         y1c = max(0, min(height, int(y1)))
         x2c = max(0, min(width, int(x2)))
@@ -1458,7 +1618,7 @@ class PriceTagProcessor:
     # ── Consensus + post-processing ──
 
     def _aggregate_fields(self, per_crop_fields: list[dict[str, Any]]) -> dict[str, Any]:
-        """Multi-frame consensus: Counter.most_common per field, проходя через валидатор."""
+        """Multi-frame consensus with field-specific tie breakers."""
         votes: dict[str, Counter] = defaultdict(Counter)
         for fields in per_crop_fields:
             for k, v in fields.items():
@@ -1469,7 +1629,7 @@ class PriceTagProcessor:
         out: dict[str, Any] = {"color": "red"}  # color: 99% red в реальных данных Lenta
 
         for field_name, counter in votes.items():
-            value, _count = counter.most_common(1)[0]
+            value = _select_counter_value(field_name, counter)
             validator = VALIDATORS.get(field_name)
             if validator is not None and not validator(value):
                 continue
