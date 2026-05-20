@@ -32,3 +32,5 @@ data/best_crops_meta.json
 eda/gt_merged.csv
 eda/gt_merged.parquet
 eda/video_probe.json
+
+*.local.*
