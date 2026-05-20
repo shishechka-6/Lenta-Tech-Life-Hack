@@ -947,11 +947,16 @@ class FieldExtractor:
         except Exception:
             return None
 
-    def extract(self, crop) -> dict[str, Any]:
-        result, _debug = self.extract_with_debug(crop)
+    def extract(self, crop, *, decode_codes: bool = True) -> dict[str, Any]:
+        result, _debug = self.extract_with_debug(crop, decode_codes=decode_codes)
         return result
 
-    def extract_with_debug(self, crop) -> tuple[dict[str, Any], dict[str, Any]]:
+    def extract_with_debug(
+        self,
+        crop,
+        *,
+        decode_codes: bool = True,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Запускает OCR/zxing/QR на одном кропе и парсит поля."""
         self.stats["crops_seen"] += 1
         debug: dict[str, Any] = {
@@ -960,6 +965,7 @@ class FieldExtractor:
             "zxing_barcode": None,
             "qr": {},
             "parsed": {},
+            "decode_codes": decode_codes,
         }
         if crop is None or crop.size == 0:
             self.stats["empty_crops"] += 1
@@ -967,8 +973,13 @@ class FieldExtractor:
             return {}, debug
 
         lines = self._ocr_lines(crop)
-        zxing_bc = self._decode_barcode_1d(crop)
-        qr = self._decode_qr(crop)
+        if decode_codes:
+            zxing_bc = self._decode_barcode_1d(crop)
+            qr = self._decode_qr(crop)
+        else:
+            self.stats["code_decode_skipped"] += 1
+            zxing_bc = None
+            qr = {}
         debug["ocr_lines"] = [_line_to_dict(line) for line in lines]
         debug["zxing_barcode"] = zxing_bc
         debug["qr"] = qr
@@ -1032,8 +1043,8 @@ class FieldExtractor:
             img = crop
             h, w = img.shape[:2]
             longest = max(h, w)
-            if longest and longest < 900:
-                scale = min(2.0, 900 / longest)
+            if longest and longest < 700:
+                scale = min(1.5, 700 / longest)
                 img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
             blur = cv2.GaussianBlur(img, (0, 0), 1.0)
             return cv2.addWeighted(img, 1.45, blur, -0.45, 0)
@@ -1132,7 +1143,7 @@ class FieldExtractor:
         except Exception:
             cv2 = None
         for roi in self._decode_rois(crop):
-            for image in self._decode_image_variants(roi, cv2=cv2, scales=(1, 2, 3)):
+            for image in self._decode_image_variants(roi, cv2=cv2, scales=(1, 2)):
                 try:
                     results = self._zxing.read_barcodes(image)
                 except Exception:
@@ -1144,7 +1155,7 @@ class FieldExtractor:
         return None
 
     def _decode_qr(self, crop) -> dict[str, Any]:
-        """Пробует WeChat QR + cv2.QRCodeDetector с апскейлом ×2,3,4.
+        """Пробует WeChat QR + cv2.QRCodeDetector с умеренным апскейлом.
         QR на ценнике ~80×80 px (2.7 px/модуль) — нужно апскейлить, чтобы достичь ≥4 px/модуль."""
         try:
             import cv2
@@ -1156,7 +1167,7 @@ class FieldExtractor:
         if self._cv_qr is None:
             self._cv_qr = cv2.QRCodeDetector()
         for roi in self._decode_rois(crop):
-            for image in self._decode_image_variants(roi, cv2=cv2, scales=(1, 2, 3, 4)):
+            for image in self._decode_image_variants(roi, cv2=cv2, scales=(1, 2, 3)):
                 if self._wechat_qr is not None:
                     try:
                         texts, _ = self._wechat_qr.detectAndDecode(image)
@@ -1182,10 +1193,7 @@ class FieldExtractor:
         rois = [crop]
         slices = (
             (0.45, 1.0, 0.0, 1.0),   # lower half: barcode/date/code often live here
-            (0.55, 1.0, 0.0, 1.0),
-            (0.35, 1.0, 0.50, 1.0),  # right/lower areas: QR is often on the right
             (0.50, 1.0, 0.50, 1.0),
-            (0.35, 0.85, 0.0, 0.55),
         )
         for y1f, y2f, x1f, x2f in slices:
             y1, y2 = int(h * y1f), int(h * y2f)
@@ -1203,17 +1211,22 @@ class FieldExtractor:
         try:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
             yield gray
-            yield cv2.equalizeHist(gray)
-            _threshold, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            yield binary
             h, w = image.shape[:2]
+            last_scaled_gray = None
             for scale in scales:
                 if scale == 1:
                     continue
                 size = (w * scale, h * scale)
-                yield cv2.resize(image, size, interpolation=cv2.INTER_CUBIC)
-                yield cv2.resize(gray, size, interpolation=cv2.INTER_CUBIC)
-                yield cv2.resize(binary, size, interpolation=cv2.INTER_NEAREST)
+                last_scaled_gray = cv2.resize(gray, size, interpolation=cv2.INTER_CUBIC)
+                yield last_scaled_gray
+            if last_scaled_gray is not None:
+                _threshold, binary = cv2.threshold(
+                    last_scaled_gray,
+                    0,
+                    255,
+                    cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+                )
+                yield binary
         except Exception:
             return
 
@@ -1234,9 +1247,11 @@ class PriceTagProcessor:
         iou: float,
         imgsz: int,
         max_frames: int | None,
-        k_best: int = 5,
+        k_best: int = 1,
         db_path: Path | None = None,
-        max_crop_side: int = 1000,
+        max_crop_side: int = 768,
+        min_track_detections: int = 2,
+        decode_codes_on_crops: int = 0,
     ) -> None:
         self.model_path = model_path
         self.device = _select_device(device)
@@ -1246,7 +1261,9 @@ class PriceTagProcessor:
         self.max_frames = max_frames
         self.k_best = max(1, int(k_best))
         self.db_path = db_path
-        self.max_crop_side = max_crop_side
+        self.max_crop_side = max(320, int(max_crop_side))
+        self.min_track_detections = max(1, int(min_track_detections))
+        self.decode_codes_on_crops = max(0, int(decode_codes_on_crops))
         self._model = None
         self._field_extractor: FieldExtractor | None = None
         self._db_codes: set[str] | None = None
@@ -1297,10 +1314,14 @@ class PriceTagProcessor:
             per_crop_fields: list[dict[str, Any]] = []
             crop_debugs: list[dict[str, Any]] = []
             for crop_idx, crop in enumerate(crops):
+                decode_codes = crop_idx < self.decode_codes_on_crops
                 if debug_dir is None:
-                    per_crop_fields.append(field_extractor.extract(crop))
+                    per_crop_fields.append(field_extractor.extract(crop, decode_codes=decode_codes))
                     continue
-                fields, crop_debug = field_extractor.extract_with_debug(crop)
+                fields, crop_debug = field_extractor.extract_with_debug(
+                    crop,
+                    decode_codes=decode_codes,
+                )
                 crop_debug["crop_path"] = self._write_debug_crop(debug_dir, track_id, crop_idx, crop)
                 per_crop_fields.append(fields)
                 crop_debugs.append(crop_debug)
@@ -1496,7 +1517,10 @@ class PriceTagProcessor:
             raise PipelineError("opencv-python-headless is not installed") from exc
 
         model = self._load_model()
-        # tracks[tid] = {'candidates': [(sharp, frame_idx, crop), ...] (top-K, sorted desc by sharpness)}
+        # tracks[tid] = {
+        #   'seen': int,
+        #   'candidates': [(sharp, frame_idx, crop), ...] (top-K, sorted desc by sharpness),
+        # }
         tracks: dict[Any, dict[str, Any]] = {}
         frames_seen = 0
         total_frames = self._video_frame_count(cv2=cv2, video_path=video_path)
@@ -1552,7 +1576,8 @@ class PriceTagProcessor:
                 sharpness = self._crop_sharpness(cv2=cv2, crop=crop)
                 crop_resized = self._resize_crop(cv2=cv2, crop=crop)
 
-                bucket = tracks.setdefault(track_id, {"candidates": []})
+                bucket = tracks.setdefault(track_id, {"seen": 0, "candidates": []})
+                bucket["seen"] += 1
                 bucket["candidates"].append((sharpness, frame_idx, crop_resized))
                 if len(bucket["candidates"]) > self.k_best:
                     bucket["candidates"].sort(key=lambda c: c[0], reverse=True)
@@ -1561,11 +1586,19 @@ class PriceTagProcessor:
         # Финализируем: вытаскиваем сами кропы (отсортированные по убыванию sharpness)
         finalized: dict[Any, dict[str, Any]] = {}
         for tid, bucket in tracks.items():
+            detections_seen = int(bucket.get("seen") or 0)
+            if detections_seen < self.min_track_detections:
+                continue
             bucket["candidates"].sort(key=lambda c: c[0], reverse=True)
             finalized[tid] = {
                 "crops": [c for _s, _f, c in bucket["candidates"]],
+                "detections_seen": detections_seen,
                 "candidate_meta": [
-                    {"sharpness": float(sharpness), "frame_idx": int(frame_idx)}
+                    {
+                        "sharpness": float(sharpness),
+                        "frame_idx": int(frame_idx),
+                        "detections_seen": detections_seen,
+                    }
                     for sharpness, frame_idx, _crop in bucket["candidates"]
                 ],
             }

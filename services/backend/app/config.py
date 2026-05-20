@@ -15,6 +15,10 @@ class Settings(BaseSettings):
     iou: float = 0.5
     imgsz: int = 1280
     max_frames: int | None = None
+    k_best_crops: int = 1
+    max_crop_side: int = 768
+    min_track_detections: int = 2
+    decode_codes_on_crops: int = 0
     max_upload_mb: int = 2048
     job_workers: int = 1
 

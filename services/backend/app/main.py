@@ -71,6 +71,10 @@ def get_processor() -> PriceTagProcessor:
             iou=settings.iou,
             imgsz=settings.imgsz,
             max_frames=settings.max_frames,
+            k_best=settings.k_best_crops,
+            max_crop_side=settings.max_crop_side,
+            min_track_detections=settings.min_track_detections,
+            decode_codes_on_crops=settings.decode_codes_on_crops,
         )
     return _processor
 
@@ -85,6 +89,10 @@ def health() -> dict[str, object]:
         "storage_dir": str(settings.storage_dir),
         "storage_writable": storage_writable,
         "device": settings.device,
+        "k_best_crops": settings.k_best_crops,
+        "max_crop_side": settings.max_crop_side,
+        "min_track_detections": settings.min_track_detections,
+        "decode_codes_on_crops": settings.decode_codes_on_crops,
     }
 
 

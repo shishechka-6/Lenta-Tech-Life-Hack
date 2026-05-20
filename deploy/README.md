@@ -31,6 +31,13 @@ vim deploy/.env.prod
 - `FRONTEND_IMAGE`
 - `MODEL_PATH`
 
+OCR сейчас по умолчанию настроен в быстрый режим:
+
+- `LENTA_K_BEST_CROPS=1` — OCR только на лучшем кропе трека. Для качества можно поднять до `2`.
+- `LENTA_MAX_CROP_SIDE=768` — ограничение размера кропа перед OCR.
+- `LENTA_MIN_TRACK_DETECTIONS=2` — отбрасывает треки, замеченные только один раз.
+- `LENTA_DECODE_CODES_ON_CROPS=0` — отключает дорогой QR/barcode decode; OCR-парсинг barcode из текста остается.
+
 ## Запуск
 
 ```bash
